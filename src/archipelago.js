@@ -33,6 +33,7 @@ $("<button>Connect!</button>").on("click", function () {
 				console.log(ex);
 			}
 			slotData = e;
+			sent_units = 0;
 			if (slotData.version) $("#appaint-version").text("APWorld Version " + slotData.version);
 			if (slotData.final_width) final_width = slotData.final_width;
 			if (slotData.final_height) final_height = slotData.final_height;
@@ -83,13 +84,24 @@ $("<button>Connect!</button>").on("click", function () {
 		});
 }).appendTo($ap_options_window.$content);
 
+// Paint Hard Mode check IDs: the 18 checks below 0.01% are 2198900 + k, then 2199000 + i is the check at i * 0.01%.
+// The server drops IDs the options didn't create, so every step up to the similarity goes out once.
+const EARLY_UNITS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 30, 40, 50, 60, 70, 80, 90]; // in 0.0001% steps
+var sent_units = 0; // similarity already sent, in 0.0001% steps
+
 function send(similarity) {
-	var locations = [];
-	// Paint Hard Mode IDs are 2199000 + the similarity in 0.01% steps. Phase 0 still checks upstream's quarter-percent grid.
-	for (var i = 1; i <= similarity * 4; i++) {
-		locations.push(2199000 + 25 * i);
+	var units = Math.floor(similarity * 10000 + 1e-7);
+	if (units > sent_units) {
+		var locations = [];
+		EARLY_UNITS.forEach(function (u, k) {
+			if (u > sent_units && u <= units) locations.push(2198900 + k + 1);
+		});
+		for (var i = Math.floor(sent_units / 100) + 1; i <= Math.floor(units / 100); i++) {
+			locations.push(2199000 + i);
+		}
+		client.check(...locations); // throws while disconnected, so sent_units only moves once they're out
+		sent_units = units;
 	}
-	client.check(...locations);
 	if (similarity >= slotData.goal_percent) client.goal();
 }
 
@@ -213,8 +225,8 @@ function onMessage(message) {
 
 function update() {
 	var c = 2;
-	var w = final_width / 2;
-	var h = final_height / 2;
+	var w = slotData.start_width ?? final_width / 2;
+	var h = slotData.start_height ?? final_height / 2;
 	for (var item of received()) {
 		switch (item) {
 			case "Additional Palette Color":

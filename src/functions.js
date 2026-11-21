@@ -2164,7 +2164,7 @@ function calculate_similarity() {
 	sim_ctx.putImageData(sim_pixels, 0, 0);
 	diff_ctx.putImageData(diff_pixels, 0, 0);
 	s *= 100 / (final_width * final_height);
-	$status_similarity.text(s.toFixed(3) + "%/" + calculate_logic_similarity().toFixed(3) + "%");
+	$status_similarity.text(s.toFixed(4) + "%/" + calculate_logic_similarity().toFixed(4) + "%");
 	return s;
 }
 
@@ -2173,8 +2173,8 @@ function calculate_logic_similarity() {
 	var r = Math.min(items.filter(x => x == "Progressive Color Depth (Red)").length, 7);
 	var g = Math.min(items.filter(x => x == "Progressive Color Depth (Green)").length, 7);
 	var b = Math.min(items.filter(x => x == "Progressive Color Depth (Blue)").length, 7);
-	var w = Math.min(items.filter(x => x == "Progressive Canvas Width").length * (slotData.canvas_width_increment ?? slotData.canvas_size_increment ?? 100), final_width / 2);
-	var h = Math.min(items.filter(x => x == "Progressive Canvas Height").length * (slotData.canvas_height_increment ?? slotData.canvas_size_increment ?? 100), final_height / 2);
+	var w = Math.min((slotData.start_width ?? final_width / 2) + items.filter(x => x == "Progressive Canvas Width").length * (slotData.canvas_width_increment ?? slotData.canvas_size_increment ?? 100), final_width);
+	var h = Math.min((slotData.start_height ?? final_height / 2) + items.filter(x => x == "Progressive Canvas Height").length * (slotData.canvas_height_increment ?? slotData.canvas_size_increment ?? 100), final_height);
 	var p = items.includes("Pick Color");
 	if (!p) {
 		r = Math.min(r, 2);
@@ -2189,7 +2189,7 @@ function calculate_logic_similarity() {
 		per_pixel = 1 - (Math.sqrt(((2 ** (7 - r) - 1) ** 2 + (2 ** (7 - g) - 1) ** 2 + (2 ** (7 - b) - 1) ** 2) * 3)) / 765;
 		if (!version_below("0.5.0")) per_pixel = 2 * per_pixel - 1;
 	}
-	return per_pixel * (final_width / 2 + w) * (final_height / 2 + h) * slotData.logic_percent / (final_width * final_height);
+	return per_pixel * w * h * slotData.logic_percent / (final_width * final_height);
 }
 
 // Note: This function is part of the API.
