@@ -8,6 +8,7 @@ import { OnCanvasHelperLayer } from "./OnCanvasHelperLayer.js";
 import { OnCanvasSelection } from "./OnCanvasSelection.js";
 import { OnCanvasTextBox } from "./OnCanvasTextBox.js";
 import { deathlink, final_height, final_width, received, send, slotData, version_below } from "./archipelago.js";
+import { worst_error } from "./shades.js";
 // import { localize } from "./app-localization.js";
 import { default_palette } from "./color-data.js";
 import { image_formats } from "./file-format-data.js";
@@ -2170,25 +2171,15 @@ function calculate_similarity() {
 
 function calculate_logic_similarity() {
 	var items = received();
-	var r = Math.min(items.filter(x => x == "Progressive Color Depth (Red)").length, 7);
-	var g = Math.min(items.filter(x => x == "Progressive Color Depth (Green)").length, 7);
-	var b = Math.min(items.filter(x => x == "Progressive Color Depth (Blue)").length, 7);
+	var table = slotData.shade_counts ?? [2];
+	// Logic assumes Paint's 2 bits at most without Pick Color: the last item count with a worst error of 31 or more.
+	var cap = table.length - 1;
+	if (!items.includes("Pick Color")) while (cap > 0 && worst_error(table[cap]) < 31) cap--;
+	var error = (name) => worst_error(table[Math.min(items.filter(x => x == name).length, cap)]);
+	var r = error("Progressive Color Depth (Red)"), g = error("Progressive Color Depth (Green)"), b = error("Progressive Color Depth (Blue)");
 	var w = Math.min((slotData.start_width ?? final_width / 2) + items.filter(x => x == "Progressive Canvas Width").length * (slotData.canvas_width_increment ?? slotData.canvas_size_increment ?? 100), final_width);
 	var h = Math.min((slotData.start_height ?? final_height / 2) + items.filter(x => x == "Progressive Canvas Height").length * (slotData.canvas_height_increment ?? slotData.canvas_size_increment ?? 100), final_height);
-	var p = items.includes("Pick Color");
-	if (!p) {
-		r = Math.min(r, 2);
-		g = Math.min(g, 2);
-		b = Math.min(b, 2);
-	}
-	var per_pixel;
-	if (version_below("0.2.0")) {
-		per_pixel = (768 - 2 ** (7 - r) - 2 ** (7 - g) - 2 ** (7 - b)) / 765;
-	}
-	else {
-		per_pixel = 1 - (Math.sqrt(((2 ** (7 - r) - 1) ** 2 + (2 ** (7 - g) - 1) ** 2 + (2 ** (7 - b) - 1) ** 2) * 3)) / 765;
-		if (!version_below("0.5.0")) per_pixel = 2 * per_pixel - 1;
-	}
+	var per_pixel = 1 - 2 * Math.sqrt((r * r + g * g + b * b) / 3) / 255; // worst case; r, g and b are worst errors here
 	return per_pixel * w * h * slotData.logic_percent / (final_width * final_height);
 }
 

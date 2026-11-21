@@ -3,6 +3,7 @@ import { calculate_similarity, clear, image_invert_colors, reset_canvas_and_hist
 import { show_help } from "./help.js";
 import { flip_horizontal, flip_vertical } from "./image-manipulation.js";
 import { tools } from "./tools.js";
+import { quantize } from "./shades.js";
 
 // Create a new instance of the Client class.
 const client = new Client();
@@ -22,7 +23,7 @@ var $ap_options_window = $Window({ title: "Archipelago Connection Options", mini
 	.addClass("maximized").addClass("focused").css({ left: 0, top: 0, width: "100vw", height: "100vh" });
 $ap_options_window.$content.append('<p><label>Host: <input name="aphost" value="archipelago.gg"></label></p><p><label>Port: <input name="apport" placeholder="38281"></label></p><p><label>Slot name: <input name="apslot"></label></p><p><label>Password: <input name="appass"></label></p>');
 $("<button>Connect!</button>").on("click", function () {
-	client.login($("[name=aphost]").val() + ":" + $("[name=apport]").val(), $("[name=apslot]").val(), "Paint Hard Mode", { "password": $("[name=appass]").val() })
+	client.login($("[name=aphost]").val() + ":" + $("[name=apport]").val(), $("[name=apslot]").val(), "Pain-T", { "password": $("[name=appass]").val() })
 		.then(function (e) {
 			console.log("Connected to the Archipelago server!", e);
 			try {
@@ -34,6 +35,7 @@ $("<button>Connect!</button>").on("click", function () {
 			}
 			slotData = e;
 			sent_units = 0;
+			matched_sent = 0;
 			if (slotData.version) $("#appaint-version").text("APWorld Version " + slotData.version);
 			if (slotData.final_width) final_width = slotData.final_width;
 			if (slotData.final_height) final_height = slotData.final_height;
@@ -84,10 +86,33 @@ $("<button>Connect!</button>").on("click", function () {
 		});
 }).appendTo($ap_options_window.$content);
 
-// Paint Hard Mode check IDs: the 18 checks below 0.01% are 2198900 + k, then 2199000 + i is the check at i * 0.01%.
+// Pain-T check IDs: the 18 checks below 0.01% are 2198900 + k, then 2199000 + i is the check at i * 0.01%.
 // The server drops IDs the options didn't create, so every step up to the similarity goes out once.
 const EARLY_UNITS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 30, 40, 50, 60, 70, 80, 90]; // in 0.0001% steps
 var sent_units = 0; // similarity already sent, in 0.0001% steps
+
+// "Matched Pixels: n" is 2198950 + n, for the 5x5 start only. A pixel is matched when each channel is at least as
+// close to the goal as black or white would be, with one step of leeway for browsers that blur canvas reads. Every
+// shade table has black and white, so the bar never rises as color items arrive, which keeps these checks as
+// reachable as logic says they are.
+const MATCHED_BASE = 2198950;
+var matched_sent = 0;
+
+function count_matched(limit) {
+	var w = Math.min(main_canvas.width, goal_canvas.width), h = Math.min(main_canvas.height, goal_canvas.height);
+	var canvas = main_canvas.ctx.getImageData(0, 0, w, h).data;
+	var goal = goal_canvas.ctx.getImageData(0, 0, w, h).data;
+	var count = 0;
+	for (var i = 0; i < canvas.length && count < limit; i += 4) {
+		var matched = canvas[i + 3] === 255;
+		for (var c = 0; c < 3 && matched; c++) {
+			var target = goal[i + c];
+			matched = Math.abs(canvas[i + c] - target) <= Math.abs(quantize(target, 2) - target) + 1;
+		}
+		if (matched) count++;
+	}
+	return count;
+}
 
 function send(similarity) {
 	var units = Math.floor(similarity * 10000 + 1e-7);
@@ -101,6 +126,15 @@ function send(similarity) {
 		}
 		client.check(...locations); // throws while disconnected, so sent_units only moves once they're out
 		sent_units = units;
+	}
+	if (matched_sent < (slotData.matched_pixels ?? 0)) {
+		var matched = count_matched(slotData.matched_pixels);
+		if (matched > matched_sent) {
+			var ids = [];
+			for (var n = matched_sent + 1; n <= matched; n++) ids.push(MATCHED_BASE + n);
+			client.check(...ids);
+			matched_sent = matched;
+		}
 	}
 	if (similarity >= slotData.goal_percent) client.goal();
 }
