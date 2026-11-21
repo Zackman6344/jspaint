@@ -22,7 +22,7 @@ var $ap_options_window = $Window({ title: "Archipelago Connection Options", mini
 	.addClass("maximized").addClass("focused").css({ left: 0, top: 0, width: "100vw", height: "100vh" });
 $ap_options_window.$content.append('<p><label>Host: <input name="aphost" value="archipelago.gg"></label></p><p><label>Port: <input name="apport" placeholder="38281"></label></p><p><label>Slot name: <input name="apslot"></label></p><p><label>Password: <input name="appass"></label></p>');
 $("<button>Connect!</button>").on("click", function () {
-	client.login($("[name=aphost]").val() + ":" + $("[name=apport]").val(), $("[name=apslot]").val(), "Paint", { "password": $("[name=appass]").val() })
+	client.login($("[name=aphost]").val() + ":" + $("[name=apport]").val(), $("[name=apslot]").val(), "Paint Hard Mode", { "password": $("[name=appass]").val() })
 		.then(function (e) {
 			console.log("Connected to the Archipelago server!", e);
 			try {
@@ -85,15 +85,9 @@ $("<button>Connect!</button>").on("click", function () {
 
 function send(similarity) {
 	var locations = [];
-	if (version_below("0.4.0")) {
-		for (var i = 1; i <= similarity; i++) {
-			locations.push(198500 + i);
-		}
-	}
-	else {
-		for (var i = 1; i <= similarity * 4; i++) {
-			locations.push(198600 + i);
-		}
+	// Paint Hard Mode IDs are 2199000 + the similarity in 0.01% steps. Phase 0 still checks upstream's quarter-percent grid.
+	for (var i = 1; i <= similarity * 4; i++) {
+		locations.push(2199000 + 25 * i);
 	}
 	client.check(...locations);
 	if (similarity >= slotData.goal_percent) client.goal();
