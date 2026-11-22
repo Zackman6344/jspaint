@@ -2,7 +2,8 @@
 /* global tool_transparent_mode:writable, palette:writable */
 /* global $canvas_area, $colorbox, $status_area, $toolbox, available_languages, get_iso_language_name, get_language, get_language_emoji, get_language_endonym, localize, magnification, main_canvas, menu_bar, MENU_DIVIDER, redos, selection, set_language, show_grid, show_thumbnail, systemHooks, undos */
 // import { available_languages, get_iso_language_name, get_language, get_language_emoji, get_language_endonym, localize, set_language } from "./app-localization.js";
-import { received, show_text_client } from "./archipelago.js";
+import { mode_unlocked, received, show_text_client } from "./archipelago.js";
+import { show_auto_copy_panel } from "./auto-copy.js";
 import { are_you_sure, change_url_param, clear, delete_selection, deselect, edit_copy, edit_cut, file_new, file_open, file_print, file_save, file_save_as, image_attributes, image_flip_and_rotate, image_invert_colors, redo, render_history_as_gif, sanity_check_blob, save_selection_to_file, select_all, set_magnification, show_about_paint, show_custom_zoom_window, show_document_history, toggle_grid, toggle_thumbnail, undo, update_magnified_canvas_size, view_bitmap } from "./functions.js";
 import { show_help } from "./help.js";
 import { is_discord_embed } from "./helpers.js";
@@ -959,7 +960,7 @@ const menus = {
 				},
 			},
 			enabled: () => {
-				return true;
+				return mode_unlocked("Similarity"); // the first Progressive Similarity Mode (D23)
 			},
 			description: localize("Changes the goal image to show the similarity with the current canvas."),
 		},
@@ -977,7 +978,7 @@ const menus = {
 				},
 			},
 			enabled: () => {
-				return true;
+				return mode_unlocked("Difference"); // the first Progressive Difference Mode (D23)
 			},
 			description: localize("Changes the goal image to show the difference from the current canvas."),
 		},
@@ -1008,6 +1009,12 @@ const menus = {
 			speech_recognition: [],
 			action: () => { show_text_client(); },
 			description: localize("Displays the Archipelago text client."),
+		},
+		{
+			label: localize("&Auto Copy"),
+			speech_recognition: [],
+			action: () => { show_auto_copy_panel(); },
+			description: localize("Opens the Auto Copy panel, which copies the goal into your canvas by itself at the speed your items allow. Shift+M starts or pauses it, and M copies the pixel under the pointer."),
 		},
 		MENU_DIVIDER,
 		{

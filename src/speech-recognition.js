@@ -1529,6 +1529,12 @@ if (speech_recognition_available) {
 						match_text: select_tool_match[0],
 						tool_id: tool.id,
 						exec: ((tool) => () => {
+							// Pain-T: a tool whose item hasn't arrived stays locked by voice too, as a toolbox click
+							// leaves it ($ToolBox.js). The phrase still matches, so "select text" can't pick Select.
+							if (tool.$button?.hasClass("disabled")) {
+								$status_text.text(`${tool.name} is locked until its item arrives.`);
+								return;
+							}
 							select_tool(tool);
 						})(tool),
 					});
@@ -1556,6 +1562,13 @@ if (speech_recognition_available) {
 						add_interpretation({
 							match_text: menu_item_phrase,
 							exec: ((menu_item) => () => {
+								// Pain-T: the menu bar's own rule (os-gui MenuBar.js is_disabled), so voice can't reach
+								// what the menu grays out, such as a view whose item hasn't arrived (D23).
+								const enabled = typeof menu_item.enabled === "function" ? menu_item.enabled() : menu_item.enabled ?? true;
+								if (!enabled) {
+									$status_text.text(`${menu_item.label.replace(/&/g, "")} isn't available now.`);
+									return;
+								}
 								if (menu_item.checkbox) {
 									menu_item.checkbox.toggle();
 								} else {

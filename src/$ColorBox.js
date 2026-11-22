@@ -1,7 +1,7 @@
 // @ts-check
 /* global $bottom, $left, $right, button, get_direction, localize, palette, selected_colors */
 import { $Component } from "./$Component.js";
-import { received, slotData } from "./archipelago.js";
+import { rungs, slotData } from "./archipelago.js";
 import { quantize } from "./shades.js";
 // import { get_direction, localize } from "./app-localization.js";
 import { show_edit_colors_window } from "./edit-colors.js";
@@ -28,9 +28,8 @@ function $Swatch(color) {
 // Pain-T: each channel gets the number of evenly spaced shades that slot_data's shade_counts table gives for
 // its Progressive Color Depth items. Before connecting there is no table, so only black and white, as in Paint.
 function legalizeColor(color) {
-	var items = received();
 	var table = slotData.shade_counts ?? [2];
-	var shades = (name) => table[Math.min(items.filter(x => x == name).length, table.length - 1)];
+	var shades = (name) => table[Math.min(rungs(name), table.length - 1)];
 	var rgb = get_rgba_from_color(color);
 	return "rgb(" + quantize(rgb[0], shades("Progressive Color Depth (Red)")) + "," +
 		quantize(rgb[1], shades("Progressive Color Depth (Green)")) + "," +

@@ -4,12 +4,13 @@
 /* global AccessKeys, current_history_node, default_airbrush_size, default_brush_shape, default_brush_size, default_canvas_height, default_canvas_width, default_eraser_size, default_magnification, default_pencil_size, default_stroke_size, enable_fs_access_api, file_name, get_direction, localize, magnification, main_canvas, main_ctx, return_to_tools, selected_colors, selected_tool, selected_tools, selection, systemHooks, textbox, transparency */
 
 import { $ColorBox } from "./$ColorBox.js";
+import { mode_unlocked } from "./archipelago.js";
 import { $ToolBox } from "./$ToolBox.js";
 import { Handles } from "./Handles.js";
 // import { get_direction, localize } from "./app-localization.js";
 import { default_palette, get_winter_palette } from "./color-data.js";
 import { image_formats } from "./file-format-data.js";
-import { $this_version_news, cancel, change_url_param, clear, confirm_overwrite_capability, delete_selection, deselect, edit_copy, edit_cut, edit_paste, file_new, file_save, file_save_as, get_tool_by_id, get_uris, image_attributes, image_flip_and_rotate, image_invert_colors, image_stretch_and_skew, load_image_from_uri, make_or_update_undoable, open_from_file, paste, paste_image_from_file, redo, render_history_as_gif, reset_canvas_and_history, reset_file, reset_selected_colors, resize_canvas_and_save_dimensions, resize_canvas_without_saving_dimensions, save_as_prompt, select_all, select_tool, select_tools, set_magnification, show_document_history, show_error_message, show_news, show_resource_load_error_message, toggle_grid, undo, update_canvas_rect, update_disable_aa, update_helper_layer, update_magnified_canvas_size, view_bitmap, write_image_file } from "./functions.js";
+import { $this_version_news, cancel, change_url_param, clear, confirm_overwrite_capability, delete_selection, deselect, edit_copy, edit_cut, edit_paste, file_new, file_save, file_save_as, get_tool_by_id, get_uris, image_attributes, image_flip_and_rotate, image_invert_colors, load_image_from_uri, make_or_update_undoable, open_from_file, paste, paste_image_from_file, redo, render_history_as_gif, reset_canvas_and_history, reset_file, reset_selected_colors, resize_canvas_and_save_dimensions, resize_canvas_without_saving_dimensions, save_as_prompt, select_all, select_tool, select_tools, set_magnification, show_document_history, show_error_message, show_news, show_resource_load_error_message, toggle_grid, undo, update_canvas_rect, update_disable_aa, update_helper_layer, update_magnified_canvas_size, view_bitmap, write_image_file } from "./functions.js";
 import { show_help } from "./help.js";
 import { $G, E, TAU, get_file_extension, get_help_folder_icon, is_discord_embed, make_canvas, to_canvas_coords } from "./helpers.js";
 import { init_webgl_stuff } from "./image-manipulation.js";
@@ -1098,10 +1099,13 @@ $G.on("keydown", (e) => {
 				image_attributes();
 				break;
 			case "M":
+				// Both views wait for the first copy of their Progressive item in seeds that have them (D23).
 				if (e.shiftKey) {
+					if (!mode_unlocked("Similarity")) break;
 					$sim.toggle();
 					$diff.hide();
 				} else {
+					if (!mode_unlocked("Difference")) break;
 					$diff.toggle();
 					$sim.hide();
 				}
@@ -1130,7 +1134,9 @@ $G.on("keydown", (e) => {
 				image_flip_and_rotate();
 				break;
 			case "W":
-				image_stretch_and_skew();
+				// Pain-T: no Stretch and Skew, as upstream's Image menu has none. Its shortcut was left, and scaled the
+				// whole picture past the canvas items without the Select item, filling what a skew uncovers with the
+				// background color.
 				break;
 
 			default:

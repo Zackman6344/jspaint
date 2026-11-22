@@ -4,6 +4,7 @@ import { show_help } from "./help.js";
 import { flip_horizontal, flip_vertical } from "./image-manipulation.js";
 import { tools } from "./tools.js";
 import { quantize } from "./shades.js";
+import { set_tool_ladders } from "./tool-sizes.js";
 
 // Create a new instance of the Client class.
 const client = new Client();
@@ -21,6 +22,11 @@ client.messages.on("message", (content) => {
 
 var $ap_options_window = $Window({ title: "Archipelago Connection Options", minimizeButton: false, maximizeButton: false, closeButton: false })
 	.addClass("maximized").addClass("focused").css({ left: 0, top: 0, width: "100vw", height: "100vh" });
+// os-gui closes any window on Escape. This one covers the page until a game connects, and comes back if it drops.
+$ap_options_window.on("close", (e) => e.preventDefault());
+// Until then the page counts as a ladder seed with no copies (D24). The sizes are page globals that app-state.js sets
+// after this module runs, so this waits for the page.
+$(() => set_tool_ladders(() => 0, tools));
 $ap_options_window.$content.append('<p><label>Host: <input name="aphost" value="archipelago.gg"></label></p><p><label>Port: <input name="apport" placeholder="38281"></label></p><p><label>Slot name: <input name="apslot"></label></p><p><label>Password: <input name="appass"></label></p>');
 $("<button>Connect!</button>").on("click", function () {
 	client.login($("[name=aphost]").val() + ":" + $("[name=apport]").val(), $("[name=apslot]").val(), "Pain-T", { "password": $("[name=appass]").val() })
@@ -34,6 +40,7 @@ $("<button>Connect!</button>").on("click", function () {
 				console.log(ex);
 			}
 			slotData = e;
+			received_cache = null;
 			sent_units = 0;
 			matched_sent = 0;
 			if (slotData.version) $("#appaint-version").text("APWorld Version " + slotData.version);
@@ -139,14 +146,53 @@ function send(similarity) {
 	if (similarity >= slotData.goal_percent) client.goal();
 }
 
-function received() {
-	var items = [];
-	for (var item of client.items.received) items.push(item.name);
-	if (version_below("0.2.0")) {
-		items.push("Magnifier");
-		items.push("Brush");
+// A stand-in for a server, for tests: test/paint-hard/auto-copy.e2e.mjs calls fake_session() from the page with slot data
+// and the items to count as received, since a test can't join a real game. A test that plays two games names them.
+var fake_items = [], fake_name = "test";
+function fake_session(slot_data, items, name = "test") {
+	slotData = slot_data;
+	fake_items = items;
+	fake_name = name;
+	received_cache = null;
+	// Every tool starts locked, as on a fresh page, so a tool shows only this session's items.
+	for (const tool of tools) tool.$button?.addClass("disabled");
+	if (slotData.final_width) final_width = slotData.final_width;
+	if (slotData.final_height) final_height = slotData.final_height;
+	update();
+}
+
+// Names this game for what the browser keeps per game, such as spent Overclock: seed, team and slot. The client keeps the
+// room's seed and your slot through a dropped connection, and so does this name, so the received items it still holds
+// aren't counted against a fresh key.
+function session_name() {
+	try {
+		const seed = client.room.seedName, self = client.players.self;
+		if (seed && self?.slot) return `${seed}-${self.team}-${self.slot}`;
+	} catch (e) { }
+	return fake_items.length ? fake_name : "offline";
+}
+
+// Every received item's name, and how many of each, kept until items arrive or the session changes. The palette rounds
+// colors and M copies pixels through these, and reading 8,000 items out of the client each time stalls the page.
+var received_cache = null;
+function received_items() {
+	if (!received_cache || received_cache.count !== client.items.count) {
+		var names = [];
+		for (var item of client.items.received) names.push(item.name);
+		names.push(...fake_items);
+		if (version_below("0.2.0")) {
+			names.push("Magnifier");
+			names.push("Brush");
+		}
+		var counts = new Map();
+		for (var name of names) counts.set(name, (counts.get(name) ?? 0) + 1);
+		received_cache = { names, counts, count: client.items.count };
 	}
-	return items;
+	return received_cache;
+}
+
+function received() {
+	return received_items().names.slice();
 }
 
 function handleTrap(name, isLinked, packet) {
@@ -245,6 +291,7 @@ function handleTrap(name, isLinked, packet) {
 }
 
 function onReceive(items) {
+	received_cache = null;
 	for (var item of items) {
 		if (item.name.endsWith("Trap")) {
 			handleTrap(item.name, false, null);
@@ -285,6 +332,9 @@ function update() {
 			case "Rounded Rectangle":
 				$("#TOOL_" + item.split("/")[0].split(" With")[0].replace(" ", "_").replace("-", "_").toUpperCase() + "").removeClass("disabled");
 				break;
+			case "Progressive Pick Color": // its first copy is the tool, its second an auto copy mode (D23)
+				$("#TOOL_PICK_COLOR").removeClass("disabled");
+				break;
 			case "Progressive Canvas Width":
 				w = Math.min(w + (slotData.canvas_width_increment ?? slotData.canvas_size_increment ?? 100), final_width);
 				break;
@@ -298,7 +348,21 @@ function update() {
 			.filter((a) => received().includes(a))[0].split("/")[0].replace(" ", "_").toUpperCase());
 	resize_canvas_without_saving_dimensions(w, h);
 	$colorbox.rebuild_palette(palette);
+	if (!mode_unlocked("Difference")) $diff.hide();
+	if (!mode_unlocked("Similarity")) $sim.hide();
+	set_tool_ladders(slotData.tool_ladders ? rungs : null, tools); // D24: each painting tool starts one pixel wide
 	calculate_similarity();
+}
+
+// How many copies of an item have arrived: the rungs of a ladder (D23), the speed tiers, the shades of a channel.
+function rungs(name) {
+	return received_items().counts.get(name) ?? 0;
+}
+
+// Difference and Similarity Mode wait for their first copy in seeds that have the ladders (D23). Older seeds, and the
+// page before a game connects, keep both views from the start, as upstream does.
+function mode_unlocked(mode) {
+	return !slotData.ladders || rungs(`Progressive ${mode} Mode`) >= 1;
 }
 
 function deathlink(method) {
@@ -350,5 +414,5 @@ function version_below(version) {
 	return false;
 }
 
-export { deathlink, final_height, final_width, received, send, show_text_client, slotData, version_below };
+export { deathlink, fake_session, final_height, final_width, mode_unlocked, received, rungs, send, session_name, show_text_client, slotData, version_below };
 

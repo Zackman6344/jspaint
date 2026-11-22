@@ -660,6 +660,13 @@ function reset_file() {
 	update_title();
 }
 
+// Pain-T: in a seed with the tool ladders (D24), the fills Paint makes by itself use white paper, not the background
+// color: New, a DeathLink reset, Clear Image from the menu or its trap, a canvas item's new strip, and turning
+// transparency off. Otherwise a background color set near the goal's average would paint the whole canvas in it.
+function paper_color() {
+	return slotData.tool_ladders ? "#ffffff" : selected_colors.background;
+}
+
 function reset_canvas_and_history() {
 	undos.length = 0;
 	redos.length = 0;
@@ -672,7 +679,7 @@ function reset_canvas_and_history() {
 	//main_canvas.width = Math.max(1, my_canvas_width);
 	//main_canvas.height = Math.max(1, my_canvas_height);
 	main_ctx.disable_image_smoothing();
-	main_ctx.fillStyle = selected_colors.background;
+	main_ctx.fillStyle = paper_color();
 	main_ctx.fillRect(0, 0, main_canvas.width, main_canvas.height);
 
 	current_history_node.image_data = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
@@ -985,6 +992,9 @@ function open_from_image_info(info, callback, canceled, into_existing_session, f
 			current_history_node.name = localize("Open");
 			current_history_node.image_data = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
 			current_history_node.icon = get_help_folder_icon("p_open.png");
+			// Pain-T: upstream's own update, from the block below that no longer runs. A session loaded over this one
+			// changes the canvas, and auto copy hears about changes it didn't make through this, then rescores.
+			$G.triggerHandler("history-update");
 		});
 	}
 	else {
@@ -2126,6 +2136,8 @@ function go_to_history_node(target_history_node, canceling) {
 
 function calculate_similarity() {
 	var s = 0;
+	// The version can't change mid-scan; asking for it at every pixel made a full rescore several times slower.
+	var before_0_2_0 = version_below("0.2.0"), before_0_5_0 = version_below("0.5.0");
 	var main_pixels = main_canvas.ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
 	var goal_pixels = goal_canvas.ctx.getImageData(0, 0, final_width, final_height);
 	var sim_pixels = sim_ctx.createImageData(final_width, final_height);
@@ -2136,7 +2148,7 @@ function calculate_similarity() {
 			if (x < main_canvas.width && y < main_canvas.height) {
 				var main_offset = (x + y * main_canvas.width) * 4;
 				var pixel_similarity = 0;
-				if (version_below("0.2.0")) {
+				if (before_0_2_0) {
 					pixel_similarity = 1 - (Math.abs(main_pixels.data[main_offset] - goal_pixels.data[goal_offset]) +
 						Math.abs(main_pixels.data[main_offset + 1] - goal_pixels.data[goal_offset + 1]) +
 						Math.abs(main_pixels.data[main_offset + 2] - goal_pixels.data[goal_offset + 2])) / 765;
@@ -2151,11 +2163,11 @@ function calculate_similarity() {
 				diff_pixels.data[goal_offset] = 128 + goal_pixels.data[goal_offset] - main_pixels.data[main_offset];
 				diff_pixels.data[goal_offset + 1] = 128 + goal_pixels.data[goal_offset + 1] - main_pixels.data[main_offset + 1];
 				diff_pixels.data[goal_offset + 2] = 128 + goal_pixels.data[goal_offset + 2] - main_pixels.data[main_offset + 2];
-				if (!version_below("0.5.0")) pixel_similarity = 2 * pixel_similarity - 1;
+				if (!before_0_5_0) pixel_similarity = 2 * pixel_similarity - 1;
 				s += pixel_similarity;
 			}
 			else {
-				if (version_below("0.5.0"))
+				if (before_0_5_0)
 					sim_pixels.data[goal_offset] = sim_pixels.data[goal_offset + 1] = sim_pixels.data[goal_offset + 2] = 0;
 				else
 					sim_pixels.data[goal_offset] = sim_pixels.data[goal_offset + 1] = sim_pixels.data[goal_offset + 2] = 128;
@@ -2174,7 +2186,7 @@ function calculate_logic_similarity() {
 	var table = slotData.shade_counts ?? [2];
 	// Logic assumes Paint's 2 bits at most without Pick Color: the last item count with a worst error of 31 or more.
 	var cap = table.length - 1;
-	if (!items.includes("Pick Color")) while (cap > 0 && worst_error(table[cap]) < 31) cap--;
+	if (!items.includes("Pick Color") && !items.includes("Progressive Pick Color")) while (cap > 0 && worst_error(table[cap]) < 31) cap--;
 	var error = (name) => worst_error(table[Math.min(items.filter(x => x == name).length, cap)]);
 	var r = error("Progressive Color Depth (Red)"), g = error("Progressive Color Depth (Green)"), b = error("Progressive Color Depth (Blue)");
 	var w = Math.min((slotData.start_width ?? final_width / 2) + items.filter(x => x == "Progressive Canvas Width").length * (slotData.canvas_width_increment ?? slotData.canvas_size_increment ?? 100), final_width);
@@ -2802,7 +2814,7 @@ function clear() {
 		if (transparency) {
 			main_ctx.clearRect(0, 0, main_canvas.width, main_canvas.height);
 		} else {
-			main_ctx.fillStyle = selected_colors.background;
+			main_ctx.fillStyle = paper_color();
 			main_ctx.fillRect(0, 0, main_canvas.width, main_canvas.height);
 		}
 		deathlink("clear");
@@ -3174,7 +3186,7 @@ function make_opaque() {
 		main_ctx.save();
 		main_ctx.globalCompositeOperation = "destination-atop";
 
-		main_ctx.fillStyle = selected_colors.background;
+		main_ctx.fillStyle = paper_color();
 		main_ctx.fillRect(0, 0, main_canvas.width, main_canvas.height);
 
 		// in case the selected background color is transparent/translucent
@@ -3207,7 +3219,7 @@ function resize_canvas_without_saving_dimensions(unclamped_width, unclamped_heig
 			main_ctx.disable_image_smoothing();
 
 			if (!transparency) {
-				main_ctx.fillStyle = selected_colors.background;
+				main_ctx.fillStyle = paper_color();
 				main_ctx.fillRect(0, 0, main_canvas.width, main_canvas.height);
 			}
 
@@ -4294,7 +4306,7 @@ function show_multi_user_setup_dialog(from_current_document) {
 
 export {
 	$this_version_news,
-	apply_file_format_and_palette_info, are_you_sure, calculate_similarity, cancel, change_some_url_params, change_url_param, choose_file_to_paste, cleanup_bitmap_view, clear, confirm_overwrite_capability, delete_selection, deselect, detect_monochrome,
+	apply_file_format_and_palette_info, are_you_sure, calculate_logic_similarity, calculate_similarity, cancel, change_some_url_params, change_url_param, choose_file_to_paste, cleanup_bitmap_view, clear, confirm_overwrite_capability, delete_selection, deselect, detect_monochrome,
 	edit_copy, edit_cut, edit_paste, exit_fullscreen_if_ios, file_load_from_url, file_new, file_open, file_print, file_save,
 	file_save_as, getSelectionText, get_all_url_params, get_history_ancestors, get_tool_by_id, get_uris, get_url_param, go_to_history_node, handle_keyshortcuts, has_any_transparency, image_attributes, image_flip_and_rotate, image_invert_colors, image_stretch_and_skew, load_image_from_uri, load_theme_from_text, make_history_node, make_monochrome_palette, make_monochrome_pattern, make_opaque, make_or_update_undoable, make_stripe_pattern, meld_selection_into_canvas,
 	meld_textbox_into_canvas, open_from_file, open_from_image_info, paste, paste_image_from_file, please_enter_a_number, read_image_file, redo, render_canvas_view, render_history_as_gif, reset_canvas_and_history, reset_file, reset_selected_colors, resize_canvas_and_save_dimensions, resize_canvas_without_saving_dimensions, sanity_check_blob, save_as_prompt, save_selection_to_file, select_all, select_tool, select_tools, set_all_url_params, set_magnification, show_about_paint, show_convert_to_black_and_white, show_custom_zoom_window, show_document_history, show_error_message, show_file_format_errors, show_multi_user_setup_dialog, show_news, show_resource_load_error_message, switch_to_polychrome_palette, toggle_grid,

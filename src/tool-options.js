@@ -4,6 +4,7 @@ import { set_magnification } from "./functions.js";
 import { $G, E, make_canvas } from "./helpers.js";
 import { render_brush, replace_colors_with_swatch, stamp_brush_canvas } from "./image-manipulation.js";
 import { get_theme } from "./theme.js";
+import { airbrush_locked, brush_locked, eraser_locked, fill_style_locked, stroke_locked } from "./tool-sizes.js";
 
 const ChooserCanvas = (
 	url,
@@ -42,7 +43,9 @@ const ChooserCanvas = (
 		// }
 		c.style.filter = invert ? "invert()" : "";
 	};
-	$(img).on("load", render);
+	// Pain-T: only while the image still loads. Every redraw of a box comes through here, and a handler bound each
+	// time stays on the cached image for good.
+	if (!img.complete) $(img).one("load", render);
 	render();
 	return c;
 };
@@ -112,22 +115,65 @@ const ChooserDiv = (
  * @param {(thing: T) => void} choose
  * @param {(thing: T) => boolean} is_chosen
  * @param {boolean=} gray_background_for_unselected
- * @returns {JQuery<HTMLDivElement> & { stroke?: boolean, fill?: boolean }}
+ * @returns {JQuery<HTMLDivElement> & { stroke?: boolean, fill?: boolean, is_locked?: (thing: T) => string }}
  */
 const $Choose = (things, display, choose, is_chosen, gray_background_for_unselected) => {
+	/** @type {JQuery<HTMLDivElement> & { is_locked?: (thing: T) => string }} */
 	const $chooser = $(E("div")).addClass("chooser").css("touch-action", "none");
+	// What an option still waits for (D24, tool-sizes.js), or "" once it's open. Each box with a ladder sets is_locked.
+	const locked = (thing) => $chooser.is_locked?.(thing) || "";
 	const choose_thing = (thing) => {
-		if (is_chosen(thing)) {
+		if (is_chosen(thing) || locked(thing)) {
 			return;
 		}
 		choose(thing);
 		$G.trigger("option-changed");
 	};
+	// Gliding through the options with the button held reads only each option's data, so it's bound once per box, and
+	// goes on when a Tool Swap Trap or an undo rebuilds the box under the held button.
+	const onpointerover_while_pointer_down = (event) => {
+		const option_container = event.target.closest(".chooser-option");
+		if (option_container) {
+			choose_thing($(option_container).data("thing"));
+		}
+	};
+	const ontouchmove_while_pointer_down = (event) => {
+		const touch = event.originalEvent.changedTouches[0];
+		const target = document.elementFromPoint(touch.clientX, touch.clientY);
+		const option_container = target.closest(".chooser-option");
+		if (option_container) {
+			choose_thing($(option_container).data("thing"));
+		}
+		event.preventDefault();
+	};
+	const onpointerup = () => {
+		$chooser.off("pointerover", onpointerover_while_pointer_down);
+		$chooser.off("touchmove", ontouchmove_while_pointer_down);
+	};
+	$chooser.on("pointerdown click", (event) => {
+		const option_container = event.target.closest(".chooser-option");
+		if (option_container) {
+			choose_thing($(option_container).data("thing"));
+		}
+		if (event.type === "pointerdown") {
+			// glide thru tool options
+			onpointerup(); // one pair at a time
+			$chooser.on("pointerover", onpointerover_while_pointer_down);
+			$chooser.on("touchmove", ontouchmove_while_pointer_down);
+		}
+	});
+	$G.on("pointerup pointercancel", onpointerup);
+	// Pain-T: the handlers each build binds, so the next build can take them off. Upstream left them all bound, so every
+	// tool switch added more, and every option change and Pick Color use ran all of them.
+	let unbind_build = () => { };
 	$chooser.on("update", () => {
 		if (!$chooser.is(":visible")) {
 			return;
 		}
+		unbind_build();
 		$chooser.empty();
+		/** @type {(() => void)[]} */
+		const updates = [];
 		for (let i = 0; i < things.length; i++) {
 			((thing) => {
 				const $option_container = $(E("div")).addClass("chooser-option").appendTo($chooser);
@@ -168,43 +214,27 @@ const $Choose = (things, display, choose, is_chosen, gray_background_for_unselec
 					$option_container.css({
 						backgroundColor: is_chosen(thing) ? selected_color : unselected_color,
 					});
+					// Only boxes with a ladder touch opacity and the title: the Magnifier hides its secret 10x option
+					// with opacity 0.
+					if ($chooser.is_locked) {
+						const waits_for = locked(thing);
+						$option_container.css({ opacity: waits_for ? 0.3 : "" }).attr("title", waits_for ? `Unlocked by ${waits_for}` : null);
+					}
 					display(thing, is_chosen(thing), reuse_canvas, reuse_div);
 				};
 				update();
 				$G.on("option-changed theme-load redraw-tool-options-because-webglcontextrestored", update);
+				updates.push(update);
 			})(things[i]);
 		}
 
-		const onpointerover_while_pointer_down = (event) => {
-			const option_container = event.target.closest(".chooser-option");
-			if (option_container) {
-				choose_thing($(option_container).data("thing"));
-			}
+		unbind_build = () => {
+			for (const update of updates) $G.off("option-changed theme-load redraw-tool-options-because-webglcontextrestored", update);
+			// ChooserDiv binds each option's own redraw for themes and zoom.
+			$chooser.find(".chooser-option > div").each((_, div) => {
+				if (div._on_zoom_etc) $G.off("theme-load resize", div._on_zoom_etc);
+			});
 		};
-		const ontouchmove_while_pointer_down = (event) => {
-			const touch = event.originalEvent.changedTouches[0];
-			const target = document.elementFromPoint(touch.clientX, touch.clientY);
-			const option_container = target.closest(".chooser-option");
-			if (option_container) {
-				choose_thing($(option_container).data("thing"));
-			}
-			event.preventDefault();
-		};
-		$chooser.on("pointerdown click", (event) => {
-			const option_container = event.target.closest(".chooser-option");
-			if (option_container) {
-				choose_thing($(option_container).data("thing"));
-			}
-			if (event.type === "pointerdown") {
-				// glide thru tool options
-				$chooser.on("pointerover", onpointerover_while_pointer_down);
-				$chooser.on("touchmove", ontouchmove_while_pointer_down);
-			}
-		});
-		$G.on("pointerup pointercancel", () => {
-			$chooser.off("pointerover", onpointerover_while_pointer_down);
-			$chooser.off("touchmove", ontouchmove_while_pointer_down);
-		});
 	});
 	return $chooser;
 };
@@ -255,6 +285,7 @@ const $ChooseShapeStyle = () => {
 
 	$chooser.fill = false;
 	$chooser.stroke = true;
+	$chooser.is_locked = (style) => fill_style_locked($chooser, style);
 
 	return $chooser;
 };
@@ -293,6 +324,7 @@ const $choose_brush = $Choose(
 		brush_size = size;
 	}, ({ shape, size }) => brush_shape === shape && brush_size === size
 ).addClass("choose-brush");
+$choose_brush.is_locked = brush_locked;
 
 const $choose_eraser_size = $Choose(
 	[4, 6, 8, 10],
@@ -310,6 +342,7 @@ const $choose_eraser_size = $Choose(
 	},
 	(size) => eraser_size === size
 ).addClass("choose-eraser");
+$choose_eraser_size.is_locked = eraser_locked;
 
 const $choose_stroke_size = $Choose(
 	[1, 2, 3, 4, 5],
@@ -327,6 +360,7 @@ const $choose_stroke_size = $Choose(
 	},
 	(size) => stroke_size === size
 ).addClass("choose-stroke-size");
+$choose_stroke_size.is_locked = stroke_locked;
 
 const magnifications = [1, 2, 6, 8, 10];
 const $choose_magnification = $Choose(
@@ -392,6 +426,7 @@ const $choose_airbrush_size = $Choose(
 	(size) => size === airbrush_size,
 	true,
 ).addClass("choose-airbrush-size");
+$choose_airbrush_size.is_locked = airbrush_locked;
 
 const $choose_transparent_mode = $Choose(
 	[false, true],
