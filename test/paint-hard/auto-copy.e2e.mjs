@@ -567,7 +567,7 @@ try {
 	check("auto copy spends the bank's own seconds first", spending.level < 3 && Math.abs(spending.filler - bank.filler) < 1e-9, `${JSON.stringify(bank)} -> ${JSON.stringify(spending)}`);
 	const kept = (await overclock_stored()).level;
 	check("...and keeps the bank's level in this browser", Math.abs(kept - (await bank_now()).level) < 0.6, `${kept} kept`);
-	check("the panel shows the bank", /The bank holds \d+ s of 3 s and fills 30 s a minute\./.test(await panel_text() || ""), await panel_text());
+	check("the panel shows the bank", /The bank holds \d+ s of 3 s and fills 30 s a minute while auto copy isn't running\./.test(await panel_text() || ""), await panel_text());
 
 	// Another tab of the same game spends 10 filler seconds, under its own page's key. This tab takes that in at its next
 	// merge, a second at most, and writes only its own page's totals, so the other tab's stay as that tab wrote them.
@@ -585,25 +585,30 @@ try {
 	const record = await overclock_stored();
 	check("...and stay in the record as that tab wrote them, beside this tab's own", (await evaluate((key) => localStorage.getItem(key), other_key)) === JSON.stringify({ spent: 10, used: 0 }) && record.pages === 2 && Math.abs(record.spent - (own.mine.spent + 10)) < 1e-9, `${JSON.stringify(record)}; this page ${JSON.stringify(own.mine)}`);
 
-	// With no fillers left and the bank drained, auto copy spends each second's fill as it comes. The record is still
-	// written once a second, not on every 50 ms tick: this page's totals and the fill note, each with its copy in
-	// sessionStorage.
+	// While auto copy spends the bank, the record is written once a second, not on every 50 ms tick: this page's totals,
+	// each with its copy in sessionStorage. The fill note isn't written at all, since the bank doesn't fill while auto
+	// copy runs (D25), so the bank's 3 s go at a second a second.
 	await receive(BANK_ITEMS, BANK_SLOT); // no Overclock fillers
-	await drain();
+	await set_bank(3);
 	await sleep(1200);
 	await focus_page();
 	await keyboard.press("m", ["Shift"]); // start
-	await sleep(1500);
+	await sleep(300);
 	const writes = await evaluate(async () => {
 		const set_item = Storage.prototype.setItem;
-		const n = { stored: 0, copies: 0 };
-		Storage.prototype.setItem = function (key, value) { if (String(key).startsWith("pain-t-overclock-")) n[this === sessionStorage ? "copies" : "stored"]++; return set_item.call(this, key, value); };
-		await new Promise((resolve) => setTimeout(resolve, 3000));
+		const n = { stored: 0, copies: 0, notes: 0 };
+		Storage.prototype.setItem = function (key, value) {
+			if (String(key).startsWith("pain-t-overclock-")) n[this === sessionStorage ? "copies" : "stored"]++;
+			if (String(key).startsWith("pain-t-overclock-fill:")) n.notes++;
+			return set_item.call(this, key, value);
+		};
+		const from = window.paint_hard_auto_copy.overclock_bank().level;
+		await new Promise((resolve) => setTimeout(resolve, 2000));
 		Storage.prototype.setItem = set_item;
-		return { ...n, bank: window.paint_hard_auto_copy.overclock_bank() };
+		return { ...n, from, bank: window.paint_hard_auto_copy.overclock_bank() };
 	});
 	await keyboard.press("m", ["Shift"]); // pause
-	check("a bank that fills as it's spent is written once a second", writes.stored <= 8 && writes.copies <= 8 && writes.bank.filler === 0 && writes.bank.level < 0.6, `${writes.stored} writes and ${writes.copies} copies in 3 s; ${JSON.stringify(writes.bank)}`);
+	check("a bank auto copy spends is written once a second, and doesn't fill while it runs", writes.stored <= 6 && writes.copies <= 6 && writes.notes === 0 && writes.from - writes.bank.level > 1.8, `${writes.stored} writes and ${writes.copies} copies in 2 s, ${writes.notes} of the fill note; ${writes.from.toFixed(3)} -> ${writes.bank.level.toFixed(3)} s banked`);
 
 	// With storage full, the browser refuses the record's writes. This tab spends from its own totals, not from what
 	// storage last took, so a full bank still drains and the fillers still run out. Here the bank holds 3 s and doesn't
@@ -648,8 +653,8 @@ try {
 	const back_in_game = { filler: (await bank_now()).filler, mine: (await evaluate(() => window.paint_hard_auto_copy.overclock_record())).mine, stored: await overclock_stored() };
 	check("a tab that plays another game and comes back keeps what it spent in the first", left_game.mine.spent > 0 && Math.abs(back_in_game.filler - left_game.filler) < 1e-9 && back_in_game.mine.spent === left_game.mine.spent && back_in_game.mine.used === left_game.mine.used && Math.abs(back_in_game.stored.spent - left_game.stored.spent) < 1e-9, `${JSON.stringify(left_game)} -> ${JSON.stringify(back_in_game)}`);
 
-	// The time left doesn't jump when auto copy pauses, though the bank fills while paused: banked seconds count as the
-	// stretch they double, and the fill as the share of each second it doubles. D25's defaults: 5 copies of each.
+	// The time left doesn't jump when auto copy pauses: banked seconds count as the stretch they double. While paused the
+	// bank fills, and the estimate falls by what that adds. D25's defaults: 5 copies of each.
 	const DEFAULT_BANK = { ...SLOT_DATA, overclock_bank_size_step: 120, overclock_fill_speed_step: 2 };
 	const DEFAULT_ITEMS = [...FULL_COLOR, ...speed_items(10), ...Array(5).fill("Progressive Overclock Bank Size"), ...Array(5).fill("Progressive Overclock Fill Speed")];
 	await receive(DEFAULT_ITEMS, DEFAULT_BANK);
@@ -670,22 +675,31 @@ try {
 	await keyboard.press("m", ["Shift"]); // start
 	await watch_line();
 	await sleep(13000);
-	// The bank's 3 s double the speed until auto copy runs them out, 3.6 s in, since the bank fills a sixth of a second a
-	// second as they're spent. From then on that fill doubles a sixth of each second: one steady line with the share.
-	const drain_lines = await lines_seen();
-	const fill_line = "1,195 pixels a second, partly Overclocked";
-	check("a bank that runs dry reads Overclocked, then one steady speed as auto copy runs on its fill", JSON.stringify(drain_lines) === JSON.stringify(["2,048 pixels a second, Overclocked", fill_line]), JSON.stringify(drain_lines));
+	// The bank's 3 s double the speed until auto copy runs them out. It doesn't fill while auto copy runs, so from then on
+	// the line reads the plain speed and the bank stays empty.
+	const drain_lines = await lines_seen(), drained_level = (await bank_now()).level;
+	const doubled_line = "2,048 pixels a second, Overclocked", plain_line = "1,024 pixels a second";
+	check("a bank that runs dry reads Overclocked, then the plain speed, and stays empty while auto copy runs", JSON.stringify(drain_lines) === JSON.stringify([doubled_line, plain_line]) && drained_level === 0, `${JSON.stringify(drain_lines)}; ${drained_level} s banked`);
 	const while_running = await time_left();
 	await keyboard.press("m", ["Shift"]); // pause
-	await sleep(2500); // the panel redraws every 2 s while stopped
-	const while_paused = await time_left(), paused_text = await panel_text();
+	const paused_at = Date.now();
+	// The bank, empty at the pause, fills from the next merge, and the panel redraws every 2 s while stopped, so the
+	// panel shows the fill within about 3 s, and the bank stays under a second for 6.
+	let paused_text = null;
+	for (let i = 0; i < 50 && !/Overclock: under 1 s/.test(paused_text ?? ""); i++) {
+		await sleep(100);
+		paused_text = await panel_text();
+	}
+	const while_paused = paused_text?.match(/pixels left, (.+?)\./)?.[1] ?? null;
 	// To the minute it rounds to, give or take one: the seconds banked while paused count as a stretch at double speed,
 	// which can take a fraction of a second off and cross a rounding line.
 	const minutes = (text) => { const m = text?.match(/(?:(\d+) h )?(\d+) min/); return m ? 60 * Number(m[1] ?? 0) + Number(m[2]) : text === "under a minute" ? 0 : NaN; };
 	check("the time left stays put when auto copy pauses", Math.abs(minutes(while_running) - minutes(while_paused)) <= 1, `running: ${while_running}; paused: ${while_paused}`);
 	check("...and a bank under a second shows as under 1 s", /Overclock: under 1 s of double speed banked\./.test(paused_text || ""), paused_text);
-	// Resumed, and after a stroke's 3 s hold-off, it reads the same, though the bank filled a little meanwhile: auto copy
-	// ran it dry seconds before, so that's part of the fill it runs on.
+	// Resumed, auto copy spends what the bank filled while paused, then reads the plain speed again. A stroke's 3 s
+	// hold-off, which auto copy waits through while it runs, fills nothing. It resumes 3 s after the pause at the soonest,
+	// so the bank holds a third of a second or more and reads Overclocked for that long.
+	await sleep(Math.max(0, paused_at + 3000 - Date.now()));
 	await focus_page();
 	await keyboard.press("m", ["Shift"]); // resume
 	await watch_line();
@@ -696,27 +710,183 @@ try {
 	await sleep(100);
 	await mouse.up();
 	await sleep(6000);
-	const resumed_lines = await lines_seen();
+	const resumed_lines = await lines_seen(), after_hold_off = (await bank_now()).level;
 	await keyboard.press("m", ["Shift"]); // pause
-	check("...and resumed, and after a stroke's hold-off, it reads the same", JSON.stringify(resumed_lines) === JSON.stringify([fill_line, "1,024 pixels a second", fill_line]), JSON.stringify(resumed_lines));
-	// At the slowest speed, a pixel a second, the line takes a decimal place.
-	const press_speed = (title, times) => evaluate((title, times) => { for (let i = 0; i < times; i++) document.querySelector(`.auto-copy-panel button[title=${title}]`).click(); }, title, times);
-	await press_speed("Slower", 10);
+	check("...and resumed, it spends what the bank filled while paused, and a hold-off fills nothing", JSON.stringify(resumed_lines) === JSON.stringify([doubled_line, plain_line]) && after_hold_off === 0, `${JSON.stringify(resumed_lines)}; ${after_hold_off} s banked after`);
+	// With 120 s banked, on a blank canvas at 1,024 pixels a second, the time left counts them as a stretch at double
+	// speed: about 2 min, where the plain speed takes about 4. The speed line reads Overclocked only while auto copy
+	// copies, and the plain speed while it's paused and while it holds off after a change, with seconds still banked.
+	await call("clear");
+	await set_bank(120);
+	await sleep(1200);
+	await focus_page();
+	await keyboard.press("m", ["Shift"]); // start
+	await keyboard.press("m", ["Shift"]); // and pause at once
+	await sleep(2500); // the panel redraws every 2 s while stopped
+	const read_panel = () => evaluate(() => {
+		const content = document.querySelector(".auto-copy-panel .window-content");
+		return { state: content.children[0].textContent, progress: content.children[1].textContent, line: content.querySelector("span").textContent, banked: window.paint_hard_auto_copy.overclock_banked() };
+	});
+	const banked_paused = await read_panel();
+	const pixels_left = Number(banked_paused.progress.match(/([\d,]+) pixels left/)?.[1].replace(/,/g, "")), banked_then = banked_paused.banked;
+	const doubled_minutes = Math.round((pixels_left <= 2048 * banked_then ? pixels_left / 2048 : banked_then + (pixels_left - 2048 * banked_then) / 1024) / 60);
+	const plain_minutes = Math.round(pixels_left / 1024 / 60);
+	check("with seconds banked, the time left counts them at double speed", minutes(banked_paused.progress.match(/pixels left, (.+?)\./)?.[1]) === doubled_minutes && doubled_minutes !== plain_minutes, `${banked_paused.progress} with ${banked_then.toFixed(1)} s banked, where it takes about ${doubled_minutes} min at double speed and ${plain_minutes} at the plain speed`);
 	await focus_page();
 	await keyboard.press("m", ["Shift"]); // resume
 	await sleep(1200);
-	const slowest = await evaluate(() => ({ line: document.querySelector(".auto-copy-panel .window-content span").textContent, speed: window.paint_hard_auto_copy.speed() }));
+	const banked_copying = await read_panel();
+	await evaluate(() => window.$G.triggerHandler("history-update")); // a change auto copy didn't make
+	await sleep(600);
+	const banked_holding = await read_panel();
 	await keyboard.press("m", ["Shift"]); // pause
-	await press_speed("Faster", 10);
-	check("...and at a pixel a second it reads 1.2", slowest.speed === 1 && slowest.line === "1.2 pixels a second, partly Overclocked", JSON.stringify(slowest));
-
-	// A clock set back, as a time sync can after a tab connects, keeps the bank filling: the fill counts from no later
-	// than now. One set forward an hour fills a minute and a half's worth at most. The page's Date.now stands in.
+	check("...and the speed line reads Overclocked only while auto copy copies, not while it's paused or holds off", banked_paused.line === plain_line && banked_copying.line === doubled_line && /Waiting a moment/.test(banked_holding.state) && banked_holding.banked > 100 && banked_holding.line === plain_line, JSON.stringify({ paused: banked_paused.line, copying: banked_copying.line, holding_off: [banked_holding.state, banked_holding.line, banked_holding.banked] }));
+	// With 240 s banked, enough to double about 491,000 pixels, the bank covers what's left, so all of it is at double
+	// speed: about 2 min still. Counting the 240 s as a stretch before the plain speed would take under a minute. Read
+	// once the panel redraws with the new level.
+	await set_bank(240);
+	let covered = null;
+	for (let i = 0; i < 50 && !/Overclock: 4 min of double speed banked/.test(covered ?? ""); i++) {
+		await sleep(100);
+		covered = await panel_text();
+	}
+	const covered_left = Number(covered?.match(/([\d,]+) pixels left/)?.[1].replace(/,/g, ""));
+	check("...and with the bank covering what's left, the time left is all at double speed", covered_left <= 2048 * 240 && minutes(covered?.match(/pixels left, (.+?)\./)?.[1]) === Math.round(covered_left / 2048 / 60), `${covered}; about ${Math.round(covered_left / 2048 / 60)} min at double speed`);
+	// The page's Date.now stands in for the clock from here on.
 	await evaluate(() => {
 		const real = Date.now;
 		window.clock = { real, offset: 0 };
 		Date.now = () => real.call(Date) + window.clock.offset;
 	});
+	// Another tab of the game runs auto copy: it holds a Web Lock named for the game and its id, and this tab, resting,
+	// doesn't fill the bank while that's held, from its first merge that reads it. Nothing compares times, so that holds
+	// through a clock set 2 minutes ahead, then an hour back, then right again, as a sleep or a time sync moves it. The
+	// page holds these locks itself, under ids no page has.
+	const fill_key = "pain-t-overclock-fill:test", other_run = "pain-t-overclock-run:test:running-tab";
+	const hold_lock = (name) => evaluate((name) => new Promise((granted) => {
+		navigator.locks.request(name, () => new Promise((release) => { window.let_go_lock = release; granted(true); }));
+	}), name);
+	// Lets go of the lock, and with `stop` moves the fill note on to now with nothing added in the same task, as a tab that
+	// stops auto copy does. Returns when, by the page's clock.
+	const let_go_lock = (stop) => evaluate((key, stop) => {
+		if (stop) localStorage.setItem(key, JSON.stringify({ ...JSON.parse(localStorage.getItem(key)), at: Date.now() }));
+		window.let_go_lock();
+		return Date.now();
+	}, fill_key, stop);
+	// The page's first merge after `after` by its clock, and within 30 s of it, so a merge from before a clock set back
+	// doesn't count, with whether it saw another tab run, and the stored note's fill read in the same task.
+	const merge_after = async (after) => {
+		for (let i = 0; i < 50; i++) {
+			const seen = await evaluate((after, key) => {
+				const { merged_at, others } = window.paint_hard_auto_copy.overclock_record();
+				if (!(merged_at > after && merged_at - after < 30000)) return null;
+				return { at: merged_at, running: others.running, filled: JSON.parse(localStorage.getItem(key) ?? "null")?.filled ?? 0 };
+			}, after, fill_key);
+			if (seen) return seen;
+			await sleep(100);
+		}
+		return null;
+	};
+	const page_now = () => evaluate(() => Date.now());
+	// Moves the clock on by `by` ms, or back to right with null, and reads the page's next 5 merges.
+	const merges_after = async (by) => {
+		let after = await evaluate((by) => { window.clock.offset = by === null ? 0 : window.clock.offset + by; return Date.now(); }, by);
+		const merges = [];
+		for (let i = 0; i < 5; i++) {
+			const merge = await merge_after(after);
+			if (!merge) break;
+			merges.push(merge);
+			after = merge.at;
+		}
+		return merges;
+	};
+	// The page's first merge from now on that sees another tab run, or that doesn't, within 5 merges.
+	const merge_seeing = async (running) => {
+		let merge = null;
+		for (let i = 0; i < 5 && merge?.running !== running; i++) merge = await merge_after(merge?.at ?? await page_now());
+		return merge?.running === running ? merge : null;
+	};
+	await hold_lock(other_run);
+	const seen_run = await merge_seeing(true);
+	const held_merges = [...await merges_after(0), ...await merges_after(120000), ...await merges_after(-3600000), ...await merges_after(null)];
+	const held_fill = held_merges.map((merge) => Number((merge.filled - seen_run?.filled).toFixed(4)));
+	check("the bank doesn't fill while another tab runs auto copy, holding its run lock, through a clock set 2 minutes ahead, an hour back and right again", !!seen_run && held_merges.length === 20 && held_merges.every((merge) => merge.running) && held_fill.every((seconds) => seconds === 0), `seconds filled by each of the 5 merges after the run was seen, after the clock went 2 minutes ahead, an hour back and right again: ${JSON.stringify(held_fill)}, ${held_merges.filter((merge) => merge.running).length} of ${held_merges.length} seeing the run`);
+	// Once the other tab stops, the fill counts from the stop note it leaves. A run that ends with no note, as when its tab
+	// crashes, says nothing of when it ended, so the fill counts from this tab's first merge since. Up to 3 tries at the
+	// stop, since a merge whose query came just before the lock was let go of still sees the run, and then nothing tells
+	// the stop from a crash.
+	await let_go_lock(false);
+	const crashed = await merge_seeing(false), after_crash = crashed && await merge_after(crashed.at);
+	let stop = null;
+	for (let i = 0; i < 3 && !stop?.first; i++) {
+		await hold_lock(other_run);
+		const held = await merge_seeing(true), stopped_at = await let_go_lock(true), next = await merge_after(stopped_at);
+		stop = { held, stopped_at, next, first: next && !next.running ? next : null, tries: i + 1 };
+	}
+	const last_held = held_merges.at(-1);
+	const crash_added = crashed && last_held ? Number((crashed.filled - last_held.filled).toFixed(4)) : NaN;
+	const crash_then = after_crash && crashed ? Number((after_crash.filled - crashed.filled).toFixed(4)) : NaN;
+	const stop_added = stop?.first && stop.held ? stop.first.filled - stop.held.filled : NaN, since_stop = stop?.first ? (stop.first.at - stop.stopped_at) / 1000 : NaN;
+	check("...and once that tab stops, the fill counts from its stop note, or from this tab's first merge since a run that ends with no note, as when its tab crashes", crash_added === 0 && crash_then > 0 && stop_added > 0 && stop_added <= since_stop / 6 + 0.002, `after a crash: ${crash_added} s at the first merge that saw no run, then ${crash_then} s at the next; after a stop: ${stop_added.toFixed(4)} s at the first merge since, ${since_stop.toFixed(3)} s after it, at 1/6 s a second, in ${stop?.tries} tries`);
+	// A lock held for another game doesn't count.
+	await hold_lock("pain-t-overclock-run:another-game:running-tab");
+	const other_game_from = await merge_after(await page_now());
+	await sleep(3000);
+	const other_game_to = await merge_after(await page_now());
+	await let_go_lock(false);
+	const other_game_fill = other_game_to && other_game_from ? Number((other_game_to.filled - other_game_from.filled).toFixed(4)) : NaN;
+	const other_game_for = other_game_to && other_game_from ? ((other_game_to.at - other_game_from.at) / 1000).toFixed(1) : "no";
+	check("...and a run lock that another game's tab holds doesn't count", other_game_fill > 0.3 && !other_game_to.running, `${other_game_fill} s filled in the ${other_game_for} s between two merges beside it, at 1/6 s a second`);
+	await drain();
+	// A tab running auto copy holds its own run lock from the moment it starts, through a clock jumped 31 s and set back an
+	// hour, sees no other tab run beside it, and lets go of the lock as it pauses.
+	const own_run = await evaluate(() => `pain-t-overclock-run:test:${window.paint_hard_auto_copy.overclock_record().page}`);
+	// Whether the page holds it, by a query after a task, so a lock let go of in the task before shows as let go.
+	const holds_own_run = () => evaluate(async (name) => {
+		await new Promise((resolve) => setTimeout(resolve));
+		return (await navigator.locks.query()).held.some((lock) => lock.name === name);
+	}, own_run);
+	// Starts auto copy as Shift+M does, and asks for the locks held in the same task, after the start's lock request.
+	const started_holding = await evaluate(async (name) => {
+		for (const type of ["keydown", "keyup"]) dispatchEvent(new KeyboardEvent(type, { key: "M", code: "KeyM", shiftKey: true, bubbles: true }));
+		return { running: window.paint_hard_auto_copy.running(), held: (await navigator.locks.query()).held.some((lock) => lock.name === name) };
+	}, own_run);
+	await evaluate(() => { window.clock.offset = 31000; });
+	await sleep(1500);
+	const held_ahead = await holds_own_run();
+	await evaluate(() => { window.clock.offset = -3600000; });
+	await sleep(1500);
+	const held_back = await holds_own_run(), alone = (await evaluate(() => window.paint_hard_auto_copy.overclock_record())).others.running;
+	await focus_page();
+	await keyboard.press("m", ["Shift"]); // pause
+	const held_paused = await holds_own_run();
+	await evaluate(() => { window.clock.offset = 0; });
+	check("a tab running auto copy holds its run lock from the moment it starts, through a clock jumped 31 s and set back an hour, sees no other tab run, and lets go of it as it pauses", started_holding.running && started_holding.held && held_ahead && held_back && alone === false && !held_paused, JSON.stringify({ started: started_holding, held_ahead, held_back, others_running: alone, held_paused }));
+	await drain();
+	// A trip through the back-forward cache while auto copy runs, with pagehide and pageshow events standing in for it: as
+	// the page goes, it lets go of its run lock. Once it's back, auto copy runs again, and the page takes the lock again at
+	// its next merge and fills nothing.
+	await focus_page();
+	await keyboard.press("m", ["Shift"]); // start
+	await sleep(1500);
+	const away = await evaluate(async (name) => {
+		dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true }));
+		await new Promise((resolve) => setTimeout(resolve));
+		const held = (await navigator.locks.query()).held.some((lock) => lock.name === name);
+		dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
+		return { held, back_at: performance.now() };
+	}, own_run);
+	let back_held = false, back_after = NaN; // once a merge takes it again, within 5 s
+	for (let i = 0; i < 50 && !back_held; i++) {
+		await sleep(100);
+		back_held = await holds_own_run();
+		if (back_held) back_after = await evaluate((at) => performance.now() - at, away.back_at);
+	}
+	const back_from = (await overclock_stored()).fill.filled;
+	await sleep(3000);
+	const back_to = (await overclock_stored()).fill.filled;
+	await keyboard.press("m", ["Shift"]); // pause
+	check("a trip through the back-forward cache lets go of the run lock as the page goes, and takes it again once it's back, with nothing filled", !away.held && back_held && back_to === back_from, `held as it went: ${away.held}; once back: ${back_held ? `held by ${Math.round(back_after)} ms after the pageshow` : "not held in 5 s"}; ${(back_to - back_from).toFixed(3)} s filled in the 3 s after`);
 	await drain();
 	await receive([...FULL_COLOR, ...speed_items(10)], BANK_SLOT); // a moment without the bank, as before connecting
 	await sleep(1200);
@@ -844,7 +1014,7 @@ try {
 	// Storage is full, so a key this tab hasn't written can't be added. The tab keeps what it spent through two reloads,
 	// from its copy in sessionStorage, under the id it keeps, and the bank keeps its level, from the copy of the fill note.
 	// Its keys go first, as for a tab whose every write was refused. The game has D25's bank, which starts empty and fills
-	// while auto copy waits, so its fill note is a new key too. Last, as it reloads the page.
+	// while auto copy is paused, so its fill note is a new key too. Last, as it reloads the page.
 	const page_id = await overclock_id();
 	await evaluate((id) => { for (const key of Object.keys(localStorage)) if (key.startsWith("pain-t-overclock-page:") && key.endsWith(`:${id}`)) localStorage.removeItem(key); }, page_id);
 	const REFUSE_NEW_KEYS = `{

@@ -98,18 +98,21 @@ const together = () => !!slotData.ladders && count_of("Progressive Similarity Mo
 const alongside = () => together() && !!auto?.running;
 
 // Overclock (D10, D25): seconds of double speed, spent only while auto copy runs. Two kinds are banked. The bank fills by
-// itself while you're connected, overclock_fill_speed_step seconds a minute for each Progressive Overclock Fill Speed, up
-// to overclock_bank_size_step seconds for each Progressive Overclock Bank Size. Each Overclock filler adds
-// overclock_seconds on top, past the bank's size if need be. The self-filled seconds are spent first, since they come
-// back. Both stay with this browser; task 7.11 moves the seconds spent to the slot's data storage, and the bank stays
-// here.
+// itself while you're connected and auto copy runs in no tab of the game, overclock_fill_speed_step seconds a minute for
+// each Progressive Overclock Fill Speed, up to overclock_bank_size_step seconds for each Progressive Overclock Bank Size.
+// A page holds a Web Lock while it runs auto copy, so a tab that rests doesn't fill the bank while another runs. Each
+// Overclock filler adds overclock_seconds on top, past the bank's size if need be. The self-filled seconds are spent
+// first, since they come back. Both stay with this browser; task 7.11 moves the seconds spent to the slot's data storage,
+// and the bank stays here.
 // Every tab of a game in this browser shares one record, kept in pieces that only one page writes. Each page writes its
 // own running totals under its own key: the seconds it took from the fillers, and from the bank. At each merge, once a
 // second or once a minute in a tab Chrome throttles, every tab adds up all the pages' totals, so seconds spent in one tab
 // don't come back in another or after a reload, and no tab can write over another's spending. Two hidden tabs merging
 // into one shared total in the same millisecond did that (D10). The bank's fill is one shared note of how many seconds
-// have filled it in all, counted up to when. A connected tab moves that note on by the time since, so two tabs don't fill
-// it twice. Every note is whole, so a tab that moves an older one on loses a second of fill at most, and adds none.
+// have filled it in all, counted up to when. While auto copy runs in no tab, a connected tab moves that note on by the
+// time since, so two tabs don't fill it twice, and a tab that stops running auto copy moves it on to then with nothing
+// added. A run also leaves word in the note, for a tab that misses it between its merges. Every note is whole, so a tab
+// that moves an older one on loses a second of fill at most, and adds none.
 // A page's key is named for its id. A tab keeps its id through reloads, in sessionStorage, so a reload writes over its
 // own key in place, and a new tab takes the id of a page that's closed, so the record keeps a key for each tab open at
 // once. Every write, of a page's totals and of the fill note, goes to sessionStorage too, which has room of its own. So a
@@ -170,9 +173,12 @@ function settle_page() {
 const overclock = {
 	session: null,
 	mine: { spent: 0, used: 0 }, // this page's totals for the game: seconds taken from the fillers, and from the bank
-	others: { spent: 0, used: 0 }, // every other page's, added up at the last merge
-	fill: { filled: 0, at: 0 }, // the newest note of the bank's fill: seconds filled in all, counted up to `at`
+	others: { spent: 0, used: 0, running: false }, // every other page's, at the last merge, and whether one ran auto copy
+	// The newest note of the bank's fill: seconds filled in all, counted up to `at`, and `running` while a run may go on.
+	fill: { filled: 0, at: 0 },
 	fill_from: Date.now(),
+	merged_at: null, // when this page last merged, by Date.now()
+	ran: false, // whether this page ran auto copy in the game at its last merge
 };
 
 const overclock_key = (what) => `pain-t-overclock-${what}:${overclock.session}`;
@@ -205,9 +211,39 @@ function write(key, value) {
 	}
 }
 
-// Every other page's totals for the game, added up.
+// A page that runs auto copy in a game holds a Web Lock named for the game and its id, from the merge as auto copy
+// starts, and lets go of it as auto copy stops, the page leaves the game, closes or goes into the back-forward cache. The
+// browser lets go of it when the page crashes. Before each once-a-second merge, a page reads which of them are held, so
+// a tab that rests sees another tab's run however its clock has moved, through a sleep or a clock change: no clock
+// decides it. Without Web Locks, no page sees another's run.
+const RUN_KEY = "pain-t-overclock-run";
+let leaving = false; // the page is closing or going into the back-forward cache, so auto copy stops running here
+const runs_here = () => !!auto?.running && !leaving;
+const run_name = () => `${RUN_KEY}:${overclock.session}:${PAGE}`;
+let run_lock = null; // the run lock this page holds or has asked for: { name, release }
+let held_runs = []; // the names of the locks held at the latest query
+
+function hold_run(name) {
+	if (run_lock?.name === name) return;
+	let_go_run();
+	if (!navigator.locks) return;
+	let release = () => { };
+	const held = new Promise((resolve) => { release = resolve; });
+	run_lock = { name, release };
+	try {
+		navigator.locks.request(name, () => held).catch(() => { });
+	} catch { }
+}
+
+function let_go_run() {
+	run_lock?.release();
+	run_lock = null;
+}
+
+// Every other page's totals for the game, added up, and whether any of them runs auto copy there: holds its run lock,
+// at the latest query.
 function others_totals() {
-	const prefix = `${overclock_key("page")}:`, own = page_key(), sum = { spent: 0, used: 0 };
+	const prefix = `${overclock_key("page")}:`, own = page_key(), sum = { spent: 0, used: 0, running: false };
 	try {
 		for (let i = 0; i < localStorage.length; i++) {
 			const key = localStorage.key(i);
@@ -217,6 +253,8 @@ function others_totals() {
 			sum.used += Number(totals?.used) || 0;
 		}
 	} catch { }
+	const runs = `${RUN_KEY}:${overclock.session}:`, own_run = run_name();
+	sum.running = held_runs.some((name) => name.startsWith(runs) && name !== own_run);
 	return sum;
 }
 
@@ -239,9 +277,9 @@ function overclock_session() {
 	if (PAGE === null) return;
 	const session = session_name();
 	if (session === overclock.session) return;
-	if (overclock.session !== null) overclock_merge(false); // what was spent in the last game stays with it
+	// What was spent in the last game stays with it, and the page no longer runs auto copy there.
+	if (overclock.session !== null) overclock_merge(false, false);
 	overclock.session = session;
-	if (auto) auto.trickle = []; // the other pages' spending is another game's now
 	// This page's own totals for the game, from this load or an earlier load of this tab, or from the closed page whose id
 	// it took. Only this page writes them, and they only grow, so the largest is the latest.
 	const totals = [kept.get(page_key()), read(page_key()), read(page_key(), sessionStorage)].filter(whole_totals);
@@ -250,19 +288,44 @@ function overclock_session() {
 	overclock_merge(false);
 }
 
-// Adds up the other pages' totals, moves the fill note on when this tab fills the bank, and writes this page's totals
-// if they changed.
-function overclock_merge(filling) {
-	const now = Date.now();
+// Adds up the other pages' totals, moves the fill note on when this tab fills the bank or has just stopped running auto
+// copy, holds this page's run lock or lets go of it, and writes this page's totals if they changed. `running` says
+// whether this page runs auto copy in this game.
+function overclock_merge(filling, running = runs_here()) {
+	const now = Date.now(), last_merge = overclock.merged_at ?? now, saw_run = overclock.others.running;
 	overclock.others = others_totals();
+	overclock.merged_at = now;
+	// The bank fills only while auto copy runs in no tab of the game (D25). `stopped`: this page ran auto copy in the
+	// game at its last merge and doesn't now, after a pause, a close, a trip into the back-forward cache, or a game left
+	// while it ran. Then the fill counts from now, and the note moves on to now with nothing added, so no tab fills the
+	// time since that merge.
+	const stopped = !running && overclock.ran;
+	overclock.ran = running;
+	if (running) hold_run(run_name());
+	else let_go_run();
+	if (running || overclock.others.running) filling = false;
+	if (stopped) overclock.fill_from = now;
 	let note = fill_note(now);
-	if (filling) {
+	// Once another tab's run ends, the fill counts from the note its stop left. Nothing says when a run ended if this tab
+	// saw it and finds no note since its last merge, or if the note says a run may go on, as a start leaves it and as a
+	// stop beside another run does: that run ended with no note of its own, as when its tab crashes, so the fill counts
+	// from now. Only in a tab that rests: while this page runs, or as it stops, the word may be its own.
+	const resting = !running && !stopped;
+	if (resting && !overclock.others.running && ((saw_run && !(note.at > last_merge)) || note.running)) overclock.fill_from = now;
+	if (filling || stopped) {
 		if (overclock.fill_from > now) overclock.fill_from = now; // the clock was set back
 		// Never counted from later than now, and at most a minute and a half back, so a clock set forward or a computer
 		// waking from sleep fills that much at most.
 		const from = Math.min(now, Math.max(note.at, overclock.fill_from, now - 90000));
 		const full = overclock.others.used + overclock.mine.used + bank_size();
-		note = { filled: Math.max(note.filled, Math.min(full, note.filled + fill_per_second() * (now - from) / 1000)), at: now };
+		const filled = Math.max(note.filled, Math.min(full, note.filled + fill_per_second() * (now - from) / 1000));
+		note = { filled, at: now, running: overclock.others.running };
+		write(overclock_key("fill"), note);
+	} else if (running && !note.running && navigator.locks?.query) {
+		// A run leaves word in the note, so a tab that misses it between merges, as one Chrome wakes once a minute,
+		// doesn't fill the bank for it if it ends with no note. A run whose word another tab's write took away puts it
+		// back here. Without Web Locks no page sees another's run, and none leaves word.
+		note = { ...note, running: true };
 		write(overclock_key("fill"), note);
 	}
 	overclock.fill = note;
@@ -297,12 +360,15 @@ function overclock_banked() {
 	return filler_banked() + bank_banked();
 }
 
-// Once a second: the merge fills the bank by real time since it was last counted, so a throttled background tab fills
-// as fast as a shown one, and time spent disconnected doesn't count.
+// Once a second: reads which pages hold run locks, then merges. The merge fills the bank by real time since it was last
+// counted, so a throttled background tab fills as fast as a shown one, and time spent disconnected, or running auto
+// copy in any tab, doesn't count. It's the one merge that fills the bank right after it reads the locks; the merge as
+// a page closes fills only while the note says no run may go on.
 function fill_bank() {
 	overclock_session();
 	if (!can_fill()) overclock.fill_from = Date.now();
-	overclock_save();
+	if (!navigator.locks?.query) return overclock_save();
+	navigator.locks.query().then((state) => { held_runs = state.held.map((lock) => lock.name); }, () => { }).then(overclock_save);
 }
 
 // Spends seconds of double speed: the self-filled ones first, then the fillers'. Returns the fillers' share.
@@ -315,22 +381,6 @@ function overclock_spend(seconds) {
 
 function overclock_save() {
 	if (overclock.session !== null) overclock_merge(can_fill());
-}
-
-// With the fillers spent, whether auto copy runs on what the bank fills: it ran the bank dry in the last 5 s, so it
-// doubles only a share of each second. A fill that lands each second, or one that keeps ahead of auto copy for a moment,
-// doesn't flip it.
-const DRY_MS = 5000, TRICKLE_MS = 15000;
-const trickling = (now = performance.now()) => !!auto && now - auto.dry_at < DRY_MS && filler_banked() === 0 && can_fill();
-// The share of each second the bank's fill doubles for this tab. Alone, a tab gets the whole fill, up to every second.
-const whole_share = () => Math.min(fill_per_second(), 1);
-// While another page spends from the bank too, the share is this tab's own over the last 15 s, once it has run on the
-// fill for 4.5 s of them. Null while no other page's bank seconds moved in that time.
-function measured_share() {
-	const ticks = auto?.trickle ?? [];
-	if (ticks.length < 2 || Math.abs(ticks.at(-1).others - ticks[0].others) <= 1e-6) return null;
-	const seconds = ticks.reduce((sum, tick) => sum + tick.elapsed, 0);
-	return seconds < 4.5 ? null : Math.min(1, ticks.reduce((sum, tick) => sum + tick.boosted, 0) / seconds);
 }
 
 // --- The running similarity total (D9) ---
@@ -747,21 +797,11 @@ function auto_tick() {
 		if (late) overclock_save();
 		const banked = overclock_banked();
 		const boosted = Math.min(elapsed, banked); // a long tick gets double speed only for the seconds still banked
-		auto.overclocked = boosted > 0;
 		if (boosted > 0) {
 			const from_fillers = overclock_spend(boosted);
-			// The fillers just ran out, and they don't come back: keep that, even if the tab closes now. Not when only the
-			// bank runs out, which happens every tick while it fills slower than auto copy spends it.
+			// The fillers just ran out, and they don't come back: keep that, even if the tab closes now. The bank's seconds
+			// reach the record at the next merge, a second at most.
 			if (late || (elapsed >= banked && from_fillers > 0)) overclock_save();
-		}
-		// For the panel's speed line: when this tab last ran out of banked seconds, and what it doubled of each tick since,
-		// while it runs on the bank's fill. The ticks start with the one that ran the bank dry, so what it held before isn't
-		// taken for the fill.
-		if (boosted < elapsed) auto.dry_at = now;
-		if (!trickling(now)) auto.trickle = [];
-		else {
-			auto.trickle.push({ at: now, elapsed, boosted, others: overclock.others.used });
-			while (auto.trickle[0].at <= now - TRICKLE_MS) auto.trickle.shift();
 		}
 		fill_allowance(allowance, speed() * (elapsed > 0 ? 1 + boosted / elapsed : 1), elapsed, elapsed);
 		const [red, green, blue] = rounding_tables();
@@ -836,7 +876,7 @@ function start_auto() {
 	} catch (error) {
 		return update_panel(`Can't start: ${error.message}`);
 	}
-	if (!auto || auto.done) auto = { ...new_progress(1000, SEND_EVERY_MS), x: 0, y: 0, pass_painted: 0, node_started: 0, done: false, waiting: "", overclocked: false, trickle: [], dry_at: -Infinity };
+	if (!auto || auto.done) auto = { ...new_progress(1000, SEND_EVERY_MS), x: 0, y: 0, pass_painted: 0, node_started: 0, done: false, waiting: "" };
 	auto.left = left;
 	auto.counted_at = performance.now();
 	auto.seen_node = current_history_node;
@@ -848,6 +888,7 @@ function start_auto() {
 	auto.running = true;
 	auto.last_tick = performance.now();
 	auto.timer = setInterval(auto_tick, 50);
+	overclock_save(); // takes this page's run lock, so other tabs stop filling the bank from their next merge
 	update_panel();
 }
 
@@ -856,8 +897,7 @@ function pause_auto(message) {
 	clearInterval(auto.timer);
 	auto.running = false;
 	auto.waiting = "";
-	auto.overclocked = false;
-	catch_up(auto, true);
+	catch_up(auto, true); // its merge lets go of the run lock and moves the fill note on to now, so the bank fills from now
 	update_panel(message);
 }
 
@@ -886,15 +926,12 @@ function seconds_text(seconds) {
 	return seconds < 120 ? `${Math.floor(seconds)} s` : minutes_text(seconds).replace("about ", "");
 }
 
-// Seconds auto copy needs for `left` pixels at `pixels` a second, where the bank's fill doubles `share` of each second.
-// Banked Overclock doubles the first stretch, which lasts banked / (1 - share) seconds, since the bank keeps filling
-// while it's spent; after that the fill still doubles its share of each second (D25). A share of every second never runs
-// out. The same whether auto copy runs, waits or is paused, so the estimate doesn't jump.
-function time_left(left, pixels, banked, share) {
-	if (share >= 1) return left / (2 * pixels);
-	const doubled = banked / (1 - share);
-	if (left <= 2 * pixels * doubled) return left / (2 * pixels);
-	return doubled + (left - 2 * pixels * doubled) / (pixels * (1 + share));
+// Seconds auto copy needs for `left` pixels at `pixels` a second. Banked Overclock doubles the first stretch, and the
+// bank doesn't fill while auto copy runs (D25). The same whether auto copy runs, waits or is paused, but for what the bank
+// fills while it's paused.
+function time_left(left, pixels, banked) {
+	if (left <= 2 * pixels * banked) return left / (2 * pixels);
+	return banked + (left - 2 * pixels * banked) / pixels;
 }
 
 function open_panel() {
@@ -954,27 +991,17 @@ function update_panel(message) {
 	const { state, progress, speed_text, tier_text, overclock_text, slower, faster, button } = panel;
 	const pixels = speed(), top = top_tier(), banked = overclock_banked();
 	const copying = !!auto?.running && !auto.waiting;
-	// With the fillers spent, a tab that runs on what the bank fills doubles a share of each second. That shows as one
-	// line with the share, which would otherwise read Overclocked for a moment each second as the fill lands.
-	const trickle = copying && trickling(), measured = measured_share();
-	const share = trickle ? measured ?? whole_share() : 0;
-	const doubled = copying && (trickle ? share >= 0.99 : banked > 0);
-	const value = pixels * (doubled ? 2 : 1 + share);
-	const label = doubled ? ", Overclocked" : share > 0 ? ", partly Overclocked" : "";
-	// A share measured beside another tab moves with each second's fill, by up to a fifteenth of the fill as one lands in
-	// the 15 s or leaves them, so that line keeps its number until it's 5% off. Any other line shows at once.
-	const last = panel.speed_shown;
-	if (!last || last.label !== label || !trickle || measured === null || Math.abs(value - last.value) > 0.05 * last.value) panel.speed_shown = { value, label };
-	const shown = panel.speed_shown.value;
-	const number = Number.isInteger(shown) ? shown.toLocaleString() : shown < 9.95 ? shown.toFixed(1) : Math.round(shown).toLocaleString();
-	speed_text.textContent = `${number} ${shown === 1 ? "pixel" : "pixels"} a second${panel.speed_shown.label}`;
+	// Overclocked while auto copy copies with seconds banked. The bank doesn't fill while it runs, so once they run out the
+	// line stays at the plain speed.
+	const doubled = copying && banked > 0, shown = pixels * (doubled ? 2 : 1);
+	speed_text.textContent = `${shown.toLocaleString()} ${shown === 1 ? "pixel" : "pixels"} a second${doubled ? ", Overclocked" : ""}`;
 	tier_text.textContent = tier() < top ? `Your top speed is ${(2 ** top).toLocaleString()} a second.`
 		: top < (slotData.auto_copy_speed_items ?? 10) ? "Your top speed. Each Progressive Auto Copy Speed doubles it."
 		: "The top speed.";
 	const size = bank_size(), per_minute = fill_per_second() * 60;
 	overclock_text.textContent = [
 		banked > 0 ? `Overclock: ${seconds_text(banked)} of double speed banked.` : "",
-		size > 0 ? `The bank holds ${seconds_text(bank_banked())} of ${seconds_text(size)}${per_minute > 0 ? ` and fills ${seconds_text(per_minute)} a minute` : ""}.` : "",
+		size > 0 ? `The bank holds ${seconds_text(bank_banked())} of ${seconds_text(size)}${per_minute > 0 ? ` and fills ${seconds_text(per_minute)} a minute while auto copy isn't running` : ""}.` : "",
 		together() ? "M copies alongside auto copy, from its own pixels a second." : "",
 	].filter(Boolean).join(" ");
 	slower.disabled = tier() === 0;
@@ -987,7 +1014,7 @@ function update_panel(message) {
 			: "Paused.");
 	progress.textContent = !auto ? "Copies the goal into your canvas, a row at a time."
 		: auto.left === 0 ? "Nothing left to copy on the canvas you've unlocked."
-		: `${auto.left.toLocaleString()} ${auto.left === 1 ? "pixel" : "pixels"} left, ${minutes_text(time_left(auto.left, pixels, banked, size > 0 ? measured ?? whole_share() : 0))}.`;
+		: `${auto.left.toLocaleString()} ${auto.left === 1 ? "pixel" : "pixels"} left, ${minutes_text(time_left(auto.left, pixels, banked))}.`;
 	button.textContent = auto?.running ? "Pause" : !auto || auto.done ? "Start" : "Resume";
 }
 
@@ -1065,8 +1092,17 @@ function init() {
 	addEventListener("keydown", on_key_down, true);
 	addEventListener("keyup", on_key_up, true);
 	addEventListener("blur", () => end_sweep(true));
-	addEventListener("pagehide", () => overclock_save());
-	setInterval(fill_bank, 1000); // the bank fills whether auto copy runs or not (D25)
+	// As the page closes or goes into the back-forward cache, auto copy stops running here: the merge lets go of the run
+	// lock and moves the fill note on, so the game's other tabs fill the bank from now. It fills the bank only while the
+	// note says no run may go on: the locks it last read may be a minute old, in a tab Chrome wakes once a minute, and a
+	// run started since has left word in the note. Back from the cache, the next merge takes the lock again while auto
+	// copy runs.
+	addEventListener("pagehide", () => {
+		leaving = true;
+		if (overclock.session !== null) overclock_merge(can_fill() && !fill_note(Date.now()).running);
+	});
+	addEventListener("pageshow", () => { leaving = false; });
+	setInterval(fill_bank, 1000); // the bank fills while auto copy runs in no tab of the game (D25)
 	$canvas_area[0].addEventListener("scroll", () => { if (sweep && !sweep.released && last_client) follow_cursor(); }); // the canvas can slide under a still cursor
 	$G.on("resize magnification-changed", () => { if (sweep) sweep.last = null; }); // pixel positions jump; don't draw a line across
 	// A history event auto copy didn't cause makes the running total stale at once, so nothing sends it before auto_tick()
@@ -1092,10 +1128,10 @@ function init() {
 			const filler = filler_banked(); // first, as it loads a new session's record
 			return { level: bank_banked(), size: bank_size(), per_second: fill_per_second(), filler };
 		},
-		// This page's own totals, the other pages' as last added up, and the fill note it works from.
+		// This page's own totals, the other pages' as last added up, the fill note it works from, and when it last merged.
 		overclock_record: () => {
 			filler_banked();
-			return { page: PAGE, mine: { ...overclock.mine }, others: { ...overclock.others }, fill: { ...overclock.fill } };
+			return { page: PAGE, mine: { ...overclock.mine }, others: { ...overclock.others }, fill: { ...overclock.fill }, merged_at: overclock.merged_at };
 		},
 		rounding_tables,
 		running: () => !!auto?.running,
