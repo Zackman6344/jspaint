@@ -144,7 +144,8 @@ function send(similarity) {
 }
 
 // A stand-in for a server, for tests: test/paint-hard/auto-copy.e2e.mjs calls fake_session() from the page with slot data
-// and the items to count as received, since a test can't join a real game. A test that plays two games names them.
+// and the items to count as received, since a test can't join a real game. A test that plays two games names them. An
+// item is its name, which arrives as progression, or { name, progression: false } for one that arrives as useful.
 var fake_items = [], fake_name = "test";
 function fake_session(slot_data, items, name = "test") {
 	slotData = slot_data;
@@ -169,23 +170,37 @@ function session_name() {
 	return fake_items.length ? fake_name : "offline";
 }
 
-// Every received item's name, and how many of each, kept until items arrive or the session changes. The palette rounds
-// colors and M copies pixels through these, and reading 8,000 items out of the client each time stalls the page.
+// Every received item's name, how many of each, and how many of each logic counts, kept until items arrive or the
+// session changes. The palette rounds colors and M copies pixels through these, and reading 8,000 items out of the
+// client each time stalls the page.
 var received_cache = null;
 function received_items() {
 	if (!received_cache || received_cache.count !== client.items.count) {
-		var names = [];
-		for (var item of client.items.received) names.push(item.name);
-		names.push(...fake_items);
+		var names = [], progression = new Map();
+		var add = (name, is_progression) => {
+			names.push(name);
+			if (is_progression) progression.set(name, (progression.get(name) ?? 0) + 1);
+		};
+		// A server sends start inventory at location -2 and cheat items (!getitem, /send) at -1, all with flags 0.
+		for (var item of client.items.received) add(item.name, item.progression || item.locationId < 0);
+		for (var fake of fake_items) add(fake.name ?? fake, fake.progression ?? true);
 		if (version_below("0.2.0")) {
 			names.push("Magnifier");
 			names.push("Brush");
 		}
 		var counts = new Map();
 		for (var name of names) counts.set(name, (counts.get(name) ?? 0) + 1);
-		received_cache = { names, counts, count: client.items.count };
+		received_cache = { names, counts, progression, count: client.items.count };
 	}
 	return received_cache;
+}
+
+// How many copies of an item logic counts (D8): each copy the server marks progression, and each at a location below 0.
+// The world makes the speed and accuracy copies that can't raise its cap useful, and the second Progressive Pick Color.
+// Its state holds every start copy, and its create_item makes each one the ceiling reads progression. A cheat item
+// counts as the copy it stands in for.
+function progression_rungs(name) {
+	return received_items().progression.get(name) ?? 0;
 }
 
 function received() {
@@ -430,5 +445,5 @@ function version_below(version) {
 	return false;
 }
 
-export { death_received, deathlink, fake_session, final_height, final_width, game_changed, handleTrap, mode_unlocked, received, rungs, send, session_name, show_text_client, slotData, version_below };
+export { death_received, deathlink, fake_session, final_height, final_width, game_changed, handleTrap, mode_unlocked, progression_rungs, received, rungs, send, session_name, show_text_client, slotData, version_below };
 

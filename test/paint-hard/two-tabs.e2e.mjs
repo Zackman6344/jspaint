@@ -31,14 +31,18 @@ const note = (text) => { if (!/not connected/i.test(text)) window.tab_errors.pus
 addEventListener("error", (event) => note(String(event.message)));
 addEventListener("unhandledrejection", (event) => note(String(event.reason?.message ?? event.reason)));
 // A check can hold auto copy's once-a-second merge, to see what a late tick, a pause, a sleep, a leave, a close or a
-// crash leaves by itself, and each tab notes when auto copy's tick came late, more than 2 s after the last.
+// crash leaves by itself, and each tab notes when auto copy's tick came late, more than 2 s after the last. Each tab
+// notes when each merge it runs starts, by its own clock: an idle tab joins a game at its first merge after set_up.
 const set_interval = window.setInterval;
 window.late_ticks = [];
+window.fill_calls = [];
 window.setInterval = function (callback, ...rest) {
 	if (typeof callback === "function" && callback.name === "fill_bank") {
 		window.merge_found = true;
 		return set_interval.call(this, () => {
-			if (!window.hold_merges) callback();
+			if (window.hold_merges) return;
+			window.fill_calls.push(Date.now());
+			callback();
 		}, ...rest);
 	}
 	if (typeof callback === "function" && callback.name === "auto_tick") {
@@ -72,17 +76,35 @@ async function open_hidden_tab(first = "") {
 	await overclock_id(evaluate);
 	return evaluate;
 }
-// The game's slot data and items, and a goal with lots of different colors, none of them white.
+// The game's slot data and items, and a goal with lots of different colors, none of them white. Returns when the game
+// changed, by the tab's clock.
 const set_up = (evaluate, slot, items, name = "test") => evaluate(async (slot, items, name) => {
 	for (const w of document.querySelectorAll(".window")) if (/Archipelago Connection Options/.test(w.textContent)) w.style.display = "none";
 	const { fake_session } = await import("/src/archipelago.js");
 	fake_session(slot, items, name);
+	const at = Date.now();
 	const { width, height } = goal_canvas;
 	const image = goal_ctx.createImageData(width, height);
 	for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) image.data.set([(x * 3 + y) % 256, (y * 2 + 50) % 256, (x + y * 3) % 256, 255], (y * width + x) * 4);
 	goal_ctx.putImageData(image, 0, 0);
 	(await import("/src/functions.js")).set_magnification(1);
+	return at;
 }, slot, items, name);
+// Waits up to 5 s for a tab's first merge after its set_up at `since`, by the tab's clock, which in an idle hidden tab
+// joins the game. Returns how many ms after the set_up it came, or null.
+const first_merge = async (tab, since) => {
+	for (let i = 0; i < 100; i++) {
+		const at = await tab((since) => window.fill_calls.find((t) => t > since) ?? null, since);
+		if (at !== null) return at - since;
+		await sleep(50);
+	}
+	return null;
+};
+// Holds a tab's merges, and returns how many it ran since its set_up at `since`.
+const hold_merges_since = (tab, since) => tab((since) => {
+	window.hold_merges = true;
+	return window.fill_calls.filter((t) => t > since).length;
+}, since);
 // Shift+M, as auto copy's own key handler hears it, which starts or pauses auto copy.
 const shift_m = () => { for (const type of ["keydown", "keyup"]) dispatchEvent(new KeyboardEvent(type, { key: "M", code: "KeyM", shiftKey: true, bubbles: true })); };
 const painted = () => {
@@ -476,12 +498,13 @@ EventTarget.prototype.addEventListener = function (type, ...rest) { if (type !==
 	// A tab that rests and closes while another runs auto copy fills nothing as it goes: the locks it last read may be a
 	// minute old, in a tab Chrome wakes once a minute, and the note says a run may go on. Its merges are held from before
 	// the other tab starts, so if its last merge filled, it would count the 4 s of the run. The fill note stays as the
-	// run's start left it.
+	// run's start left it. A tab that hasn't merged since set_up is still in its last game, and its close would leave
+	// this note as it was whatever it did, so the hold waits for the resting tab's first merge in the game.
 	const k = await open_hidden_tab();
-	await set_up(k, BANK_SLOT, QUIET_ITEMS, "closing-resting");
+	const k_set_up = await set_up(k, BANK_SLOT, QUIET_ITEMS, "closing-resting");
 	await set_up(a, BANK_SLOT, QUIET_ITEMS, "closing-resting");
-	await sleep(1200);
-	await k(() => { window.hold_merges = true; });
+	const k_first = await first_merge(k, k_set_up);
+	const k_merges = await hold_merges_since(k, k_set_up);
 	await sleep(1200); // a merge already waiting on its query is done by now
 	const resting_start = await a(start_and_hold, "closing-resting", true);
 	await sleep(4000);
@@ -493,15 +516,15 @@ EventTarget.prototype.addEventListener = function (type, ...rest) { if (type !==
 	const resting_after = await a(fill_text, "closing-resting");
 	await a(shift_m);
 	const resting_word = JSON.parse(resting_before ?? "null")?.running === true;
-	check("a resting tab that closes while another runs auto copy, its merges held since before the run, fills nothing as it goes", resting_start.held && resting_word && resting_after === resting_before, `holding its run lock as it started: ${resting_start.held}, the note saying a run may go on: ${resting_word}; the fill note ${resting_before} before the close and ${resting_after} after`);
+	check("a resting tab that closes while another runs auto copy, its merges held since before the run, fills nothing as it goes", k_merges > 0 && resting_start.held && resting_word && resting_after === resting_before, `${k_merges} merge${k_merges === 1 ? "" : "s"} in the game before its hold, the first ${k_first} ms after its set_up; holding its run lock as it started: ${resting_start.held}, the note saying a run may go on: ${resting_word}; the fill note ${resting_before} before the close and ${resting_after} after`);
 
 	// With no run, the game's last tab fills the time since its last merge as it closes, since no other tab would: its
-	// merges are held for the 5 s before, so it counts them.
+	// merges are held for the 5 s before, so it counts them. Its hold waits for its first merge in the game too.
 	const l = await open_hidden_tab();
-	await set_up(l, BANK_SLOT, QUIET_ITEMS, "closing-last");
-	await sleep(1200);
+	const l_set_up = await set_up(l, BANK_SLOT, QUIET_ITEMS, "closing-last");
+	const l_first = await first_merge(l, l_set_up);
 	const last_held_at = Date.now();
-	await l(() => { window.hold_merges = true; });
+	const l_merges = await hold_merges_since(l, l_set_up);
 	await sleep(1200);
 	const last_from = await a(note_of, "closing-last");
 	await sleep(4000);
@@ -511,7 +534,7 @@ EventTarget.prototype.addEventListener = function (type, ...rest) { if (type !==
 	await sleep(500);
 	const last_to = await a(note_of, "closing-last");
 	const last_most = (last_closed_at - last_held_at + 1000) / 6000; // from its last merge, at most a second before the hold
-	check("...and with no run, the game's last tab fills the time since its last merge as it closes", last_to - last_from > 0.5 && last_to - last_from <= last_most + 0.02, `${(last_to - last_from).toFixed(3)} s filled as it closed, its merges held for the ${((last_closed_at - last_held_at) / 1000).toFixed(1)} s before, at 1/6 s a second`);
+	check("...and with no run, the game's last tab fills the time since its last merge as it closes", l_merges > 0 && last_to - last_from > 0.5 && last_to - last_from <= last_most + 0.02, `${l_merges} merge${l_merges === 1 ? "" : "s"} in the game before its hold, the first ${l_first} ms after its set_up; ${(last_to - last_from).toFixed(3)} s filled as it closed, its merges held for the ${((last_closed_at - last_held_at) / 1000).toFixed(1)} s before, at 1/6 s a second`);
 
 	// A run can start and crash between a resting tab's merges, as between a minute's wakes, so that tab never sees its
 	// lock. The run leaves word in the fill note as it starts, so the resting tab, finding the word and no lock, fills from

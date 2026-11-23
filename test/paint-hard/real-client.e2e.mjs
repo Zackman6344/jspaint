@@ -1,23 +1,25 @@
 // End-to-end test of Pain-T through its real Archipelago client: what reaches the server and what survives a dropped
 // connection. Before the page loads, window.WebSocket is replaced by a stand-in for MultiServer that answers RoomInfo,
 // GetDataPackage (built from the APWorld's items.py), Connect and Get, records LocationChecks, and can drop the
-// connection; the page logs in through its own Connect button. Adapted from the Phase 3 review's harness.
+// connection; the page logs in through its own Connect button. Last, the page logs in to a second seed, one with
+// starting_color_depth 1, whose items come as a server sends start inventory and cheat items, for logic's ceiling.
+// Adapted from the Phase 3 review's harness.
 // Usage: node test/paint-hard/real-client.e2e.mjs [--headful]. It reads items.py and test/client_contract.json from the
 // APWorld checkout beside this one; set PAIN_T_ITEMS_PY and PAIN_T_CONTRACT to read them from elsewhere.
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { miss_margin, miss_percent } from "../../src/misses.js";
-import { check, evaluate, finish, mouse, open_paint, overclock_id, page, page_errors, sleep } from "./harness.mjs";
+import { check, evaluate, finish, mouse, open_paint, overclock_id, page, page_errors, same, sleep } from "./harness.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const WORLD = path.join(ROOT, "..", "paint-hard-apworld", "worlds", "paint_hard");
 const ITEMS_PY = process.env.PAIN_T_ITEMS_PY || path.join(WORLD, "items.py");
 // What the world writes for the client beyond items.py: each tool ladder's copies, the accuracy copies, the margin copies
-// at the default miss_margin_step, and the slot data at the default options (its test_client_contract.py keeps the
-// file true).
+// at the default miss_margin_step, the slot data at the default options, and what logic's ceiling is checked against
+// (its test_client_contract.py keeps the file true).
 const CONTRACT_JSON = process.env.PAIN_T_CONTRACT || path.join(WORLD, "test", "client_contract.json");
-const CONTRACT = JSON.parse(fs.readFileSync(CONTRACT_JSON, "utf8"));
+const CONTRACT = JSON.parse(fs.readFileSync(CONTRACT_JSON, "utf8")), LOGIC = CONTRACT.logic;
 
 // The item table, from items.py itself, so a name that differs between the two repos fails here.
 const ITEMS = {};
@@ -34,8 +36,14 @@ names.push("Progressive Brush Size"); // D24's names come through too
 names.push(...Array(CONTRACT.accuracy_items).fill("Progressive Auto Copy Accuracy"), "Progressive Miss Margin", "Auto Copy Loop");
 // Late in a default solo seed the client holds about 8,000 items. Canvas items past the goal's size change nothing.
 names.push(...Array(7200).fill("Progressive Canvas Width"));
-const LATE_ITEM = { item: id_of("Progressive Canvas Width"), location: 2199000 + 9000 + names.length, player: 1, flags: 0 };
-const START_ITEMS = names.map((name, i) => ({ item: id_of(name), location: 2199000 + 9000 + i, player: 1, flags: 0 }));
+// Each item's flags as the world classifies it at the defaults (D8): progression (1) for the color and canvas items,
+// Pick Color's first copy, every accuracy copy and the 8 speed copies that can still raise logic's cap at 6 h; filler
+// (0) for Overclock; useful (2) for the rest, the 2 other speed copies among them.
+const PROGRESSION = new Set(["Progressive Color Depth (Red)", "Progressive Color Depth (Green)", "Progressive Color Depth (Blue)", "Progressive Canvas Width", "Progressive Canvas Height", "Progressive Pick Color", "Progressive Auto Copy Accuracy"]);
+let speed_copies = 0;
+const flags_of = (name) => (name === "Overclock" ? 0 : name === "Progressive Auto Copy Speed" ? (++speed_copies <= LOGIC.speed_progression ? 1 : 2) : PROGRESSION.has(name) ? 1 : 2);
+const LATE_ITEM = { item: id_of("Progressive Canvas Width"), location: 2199000 + 9000 + names.length, player: 1, flags: 1 };
+const START_ITEMS = names.map((name, i) => ({ item: id_of(name), location: 2199000 + 9000 + i, player: 1, flags: flags_of(name) }));
 
 // Locations as a default 800x600 seed has them: 18 early checks, 25 Matched Pixels, a check every 0.01% up to 80%.
 const LOCATIONS = [];
@@ -44,23 +52,31 @@ for (let n = 1; n <= 25; n++) LOCATIONS.push(2198950 + n);
 for (let i = 1; i <= 8000; i++) LOCATIONS.push(2199000 + i);
 // The world's own slot data at its defaults, with only what this test needs changed. Each changed key has to be one the
 // world writes, so a rename on that side can't hide behind a value typed here. miss_margin_step is 5 rather than the
-// default 1, so a client that read the key and went on at a step of 1 would show.
-const OVERRIDES = { overclock_seconds: 2, miss_margin_step: 5, version: "1.0.0" };
+// default 1, so a client that read the key and went on at a step of 1 would show. The version is the world's, 1.1.0
+// from Phase 5 on, which the contract leaves out.
+const OVERRIDES = { overclock_seconds: 2, miss_margin_step: 5, version: "1.1.0" };
 const SLOT_DATA = { ...CONTRACT.slot_data, ...OVERRIDES };
 const CONFIG = { seed: "SEED42", items: START_ITEMS, late_item: LATE_ITEM, locations: LOCATIONS, slot_data: SLOT_DATA, package: { checksum: "items-py", item_name_to_id: ITEMS, location_name_to_id: {} } };
+// The second seed: the world's slot data and start inventory for starting_color_depth 1, the inventory as
+// MultiServer.py:545 sends it, at location -2 from player 0 with flags 0.
+const START_SLOT_DATA = { ...CONTRACT.slot_data, ...LOGIC.slot_data_changes.starting_color_depth_1, version: OVERRIDES.version };
+const START_INVENTORY = LOGIC.start_inventory.map((name) => ({ item: id_of(name), location: -2, player: 0, flags: 0 }));
+const START_CONFIG = { ...CONFIG, seed: "SEED43", items: START_INVENTORY, slot_data: START_SLOT_DATA };
 
 // The stand-in server, in the page. It keeps what was checked in sessionStorage, so a reload sees it.
-const FAKE_SERVER = `(() => {
-	const CONFIG = ${JSON.stringify(CONFIG)};
+const fake_server = (config) => `(() => {
+	const CONFIG = ${JSON.stringify(config)};
 	// The seconds the game's Overclock fillers have given, added up over every page's totals (auto-copy.js).
-	window.spent_stored = () => Object.keys(localStorage).filter((key) => key.startsWith("pain-t-overclock-page:SEED42-0-1:")).reduce((sum, key) => sum + JSON.parse(localStorage.getItem(key)).spent, 0);
-	const store = (() => { try { return JSON.parse(sessionStorage.getItem("fake-ap") || "null"); } catch { return null; } })() || { checked: [] };
-	const save = () => { try { sessionStorage.setItem("fake-ap", JSON.stringify(store)); } catch { } };
+	window.spent_stored = () => Object.keys(localStorage).filter((key) => key.startsWith("pain-t-overclock-page:" + CONFIG.seed + "-0-1:")).reduce((sum, key) => sum + JSON.parse(localStorage.getItem(key)).spent, 0);
+	const store = (() => { try { return JSON.parse(sessionStorage.getItem("fake-ap:" + CONFIG.seed) || "null"); } catch { return null; } })() || { checked: [] };
+	const save = () => { try { sessionStorage.setItem("fake-ap:" + CONFIG.seed, JSON.stringify(store)); } catch { } };
 	const ap = window.__ap = {
 		log: [], sockets: [], received: 0,
 		drop() { const s = ap.sockets.at(-1); if (s) s._drop(); },
 		// One more item for this slot, as another player's check would send it.
 		push(item = CONFIG.late_item.item) { const s = ap.sockets.at(-1); if (!s) return; s._reply([{ cmd: "ReceivedItems", index: ap.received, items: [{ ...CONFIG.late_item, item }] }]); ap.received++; },
+		// Items as the server sends them, in one packet.
+		give(items) { const s = ap.sockets.at(-1); if (!s) return; s._reply([{ cmd: "ReceivedItems", index: ap.received, items }]); ap.received += items.length; },
 	};
 	class FakeWebSocket {
 		constructor(url) {
@@ -89,6 +105,7 @@ const FAKE_SERVER = `(() => {
 	Object.assign(FakeWebSocket, { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 });
 	window.WebSocket = FakeWebSocket;
 })();`;
+const FAKE_SERVER = fake_server(CONFIG);
 
 const ready = () => typeof goal_canvas !== "undefined" && main_canvas.width > 0 && !!window.paint_hard_auto_copy;
 const shift_m = async () => {
@@ -102,6 +119,35 @@ const connect = async () => {
 	await evaluate(() => { $("[name=aphost]").val("fake.test"); $("[name=apport]").val("38281"); $("[name=apslot]").val("Painter"); $("button").filter((i, b) => b.textContent === "Connect!").trigger("click"); });
 	for (let i = 0; i < 100 && (await window_shown()); i++) await sleep(100);
 	await sleep(500);
+};
+
+// Logic's ceiling in the second seed. What the client holds of each item the ceiling reads, in this order, how many of
+// each it counts, and the ceiling.
+const LOGIC_NAMES = ["Progressive Color Depth (Red)", "Progressive Color Depth (Green)", "Progressive Color Depth (Blue)", "Progressive Canvas Width", "Progressive Canvas Height", "Progressive Auto Copy Speed", "Progressive Auto Copy Accuracy", "Progressive Pick Color"];
+const logic_now = () => evaluate(async (names) => {
+	const ap = await import("/src/archipelago.js");
+	return { session: ap.session_name(), held: names.map((name) => ap.rungs(name)).join(","), counted: names.map((name) => ap.progression_rungs(name)).join(","), ceiling: (await import("/src/functions.js")).calculate_logic_similarity() };
+}, LOGIC_NAMES);
+// The world's ceiling at the defaults' hours for a state, (color items in each channel, width and height items, speed
+// and accuracy copies logic counts, Pick Color): test_auto_copy_logic.py's, or the world's own at the contract's more
+// states.
+const world_ceiling = (state) => {
+	const at = (states) => states.findIndex((s) => JSON.stringify(s) === JSON.stringify(state));
+	if (at(LOGIC.states) >= 0) return LOGIC.ceilings[START_SLOT_DATA.auto_copy_logic_hours][at(LOGIC.states)];
+	if (at(LOGIC.more_states) >= 0) return LOGIC.more_ceilings[at(LOGIC.more_states)];
+	throw new Error(`the contract has no ceiling at ${JSON.stringify(state)}`);
+};
+const close = (a, b) => Math.abs(a - b) < 5e-7; // the world rounds to 6 decimals
+// Found items as the server sends them: from this slot, each at a location of its own, with flags 1 for progression
+// and 2 for useful, as the world classifies them.
+let found_at = 2199000 + 20000;
+const found = (name, n, flags = 1) => Array.from({ length: n }, () => ({ item: id_of(name), location: found_at++, player: 1, flags }));
+// Sends items in one packet and waits until the client holds them.
+const received_count = () => evaluate(async () => (await import("/src/archipelago.js")).received().length);
+const give = async (items) => {
+	const want = (await received_count()) + items.length;
+	await evaluate((items) => __ap.give(items), items);
+	for (let i = 0; i < 50 && (await received_count()) < want; i++) await sleep(100);
 };
 
 // Every item the client spells out in quotes: the ladders, the speed copies, the Overclock bank. The other e2e tests type
@@ -140,7 +186,7 @@ try {
 	const unread = [...READ_KEYS].filter((key) => !CONTRACT.slot_data_keys.includes(key) && !OLDER_SEEDS_ONLY.includes(key));
 	const from_today = [...READ_KEYS].filter((key) => !OLDER_SEEDS_ONLY.includes(key));
 	check("every slot data key the client reads is one the world writes", READ_KEYS.size >= 15 && unread.length === 0 && UNNAMED_READS.length === 0, unread.length ? `not written: ${unread.join(", ")}` : UNNAMED_READS.length ? `reads the scan can't name: ${UNNAMED_READS.join("; ")}` : `${from_today.length} keys read from today's seeds, and ${OLDER_SEEDS_ONLY.length} only older seeds wrote`);
-	await page("Page.addScriptToEvaluateOnNewDocument", { source: FAKE_SERVER });
+	const { identifier: first_server } = await page("Page.addScriptToEvaluateOnNewDocument", { source: FAKE_SERVER });
 	await open_paint(ready, { hide_connection_window: false });
 	check("items.py has the names this test sends", names.every((name) => name in ITEMS), `${Object.keys(ITEMS).length} items read from ${ITEMS_PY}`);
 	check("before connecting, the session is offline", (await session()) === "offline", await session());
@@ -151,6 +197,8 @@ try {
 	const size = await evaluate(() => `${main_canvas.width}x${main_canvas.height}`);
 	check("the page logs in through its own Connect button", !(await window_shown()) && size === "800x600", size);
 	check("...and names the session seed-team-slot", (await session()) === "SEED42-0-1", await session());
+	const version_line = await evaluate(() => $("#appaint-version").text().trim());
+	check(`...and shows the APWorld version the slot data names, ${SLOT_DATA.version}`, version_line === `APWorld Version ${SLOT_DATA.version}`, version_line);
 	const named = await evaluate(async () => {
 		const ap = await import("/src/archipelago.js");
 		const brush = [...document.querySelectorAll(".tool-options .chooser-option")].length;
@@ -159,6 +207,14 @@ try {
 	check("items.py's names reach the client: 10 speed tiers, 2 Overclocks (4 s), both views, Pick Color, a Brush Size", named.top === 10 && named.banked === 4 && named.sim && named.diff && named.pick && named.brush_rung === 1, JSON.stringify(named));
 	// The world's miss_margin_step reaches the client too: one Progressive Miss Margin at step 5 takes 5 off 255.
 	check("...and Phase 4's: the world's accuracy copies leave no misses, one margin copy at step 5 a margin of 250, and Auto Copy Loop is on", named.miss === 0 && named.margin === 250 && SLOT_DATA.miss_margin_step === 5 && named.loop, JSON.stringify({ miss: named.miss, margin: named.margin, loop: named.loop, miss_margin_step: SLOT_DATA.miss_margin_step }));
+	// Logic (D8) counts a found copy only when the server marks it progression: 8 of the 10 speed copies. With every item
+	// its ceiling is the whole logic percent, since 8 copies get all 480,000 pixels right in the world's 6 h, and so would
+	// 10. The second seed below checks the ceiling where the useful copies would raise it.
+	const logic = await evaluate(async () => {
+		const ap = await import("/src/archipelago.js");
+		return { speed: ap.rungs("Progressive Auto Copy Speed"), counted: ap.progression_rungs("Progressive Auto Copy Speed"), ceiling: (await import("/src/functions.js")).calculate_logic_similarity() };
+	});
+	check("...and logic counts only the found copies marked progression, 8 of 10 speed copies, and with every item its ceiling is the whole logic percent", logic.speed === 10 && logic.counted === LOGIC.speed_progression && Math.abs(logic.ceiling - SLOT_DATA.logic_percent) < 1e-9 && SLOT_DATA.auto_copy_logic_hours === 6, JSON.stringify({ ...logic, hours: SLOT_DATA.auto_copy_logic_hours }));
 	for (let i = 0; i < 50 && !(await evaluate(() => goal_ctx.getImageData(400, 300, 1, 1).data[3] === 255)); i++) await sleep(100);
 
 	// Auto copy at the top speed, connected: what goes out, and how often.
@@ -257,6 +313,36 @@ try {
 	}, CONTRACT.tool_ladders);
 	const off = Object.entries(rungs).filter(([, r]) => !r.short || r.every !== "").map(([ladder, r]) => `${ladder}: ${JSON.stringify(r)}`);
 	check("each tool ladder's last copy opens its box's largest option, and not one copy sooner", Object.keys(rungs).length === 9 && off.length === 0, off.join("; ") || "all 9");
+
+	// The second seed, with starting_color_depth 1: the page reloads and logs in to it. The world's state holds its start
+	// inventory, Magnifier, the starting tool and a color item of each channel, which the server sends at location -2 with
+	// flags 0. A !getitem width comes at location -1 from the slot itself, with flags 0 (MultiServer.py:1663), beside a
+	// found height. Then every color and canvas item, Pick Color, 2 accuracy copies, and 5 speed copies, 3 progression and
+	// 2 useful: the 3 get 51,840 pixels right in the world's 6 h, and the 5 would get 207,360. Last, the rest of the speed
+	// and accuracy copies.
+	await page("Page.removeScriptToEvaluateOnNewDocument", { identifier: first_server });
+	await page("Page.addScriptToEvaluateOnNewDocument", { source: fake_server(START_CONFIG) });
+	await page("Page.reload", {});
+	await sleep(500);
+	for (let i = 0; i < 200 && !(await evaluate(ready).catch(() => false)); i++) await sleep(100);
+	await sleep(500);
+	await overclock_id();
+	await connect();
+	const start = await logic_now();
+	check("start inventory, sent at location -2 with flags 0, counts toward logic's ceiling as the world counts it: the start of a seed with starting_color_depth 1", start.session === "SEED43-0-1" && same(LOGIC.start_inventory.slice(0, 2), ["Magnifier", "Brush"]) && start.counted === "1,1,1,0,0,0,0,0" && close(start.ceiling, world_ceiling([1, 0, 0, 0, 0, false])), JSON.stringify({ ...start, world: world_ceiling([1, 0, 0, 0, 0, false]), start_inventory: LOGIC.start_inventory }));
+	await give([{ item: id_of("Progressive Canvas Width"), location: -1, player: 1, flags: 0 }, ...found("Progressive Canvas Height", 1)]);
+	const cheat = await logic_now();
+	check("...and so does a cheat item, sent at location -1 with flags 0, beside a found copy marked progression", cheat.counted === "1,1,1,1,1,0,0,0" && close(cheat.ceiling, world_ceiling([1, 1, 1, 0, 0, false])), JSON.stringify({ ...cheat, world: world_ceiling([1, 1, 1, 0, 0, false]) }));
+	const colors = START_SLOT_DATA.shade_counts.length - 1; // color items in each channel, the start's among them
+	const widths = Math.ceil((START_SLOT_DATA.final_width - START_SLOT_DATA.start_width) / START_SLOT_DATA.canvas_width_increment);
+	const heights = Math.ceil((START_SLOT_DATA.final_height - START_SLOT_DATA.start_height) / START_SLOT_DATA.canvas_height_increment);
+	const useful_speed = START_SLOT_DATA.auto_copy_speed_items - LOGIC.speed_progression;
+	await give([...["Red", "Green", "Blue"].flatMap((channel) => found(`Progressive Color Depth (${channel})`, colors - 1)), ...found("Progressive Canvas Width", widths - 1), ...found("Progressive Canvas Height", heights - 1), ...found("Progressive Pick Color", 1), ...found("Progressive Auto Copy Accuracy", 2), ...found("Progressive Auto Copy Speed", 3), ...found("Progressive Auto Copy Speed", useful_speed, 2)]);
+	const useful = await logic_now(), useful_state = [colors, widths, heights, 3, 2, true];
+	check(`...and a speed copy marked useful doesn't count: with 3 progression and ${useful_speed} useful speed copies and 2 accuracy copies the ceiling is the world's for the 3`, useful_speed > 0 && useful.held.split(",")[5] === String(3 + useful_speed) && useful.counted === `${colors},${colors},${colors},${widths},${heights},3,2,1` && close(useful.ceiling, world_ceiling(useful_state)), JSON.stringify({ ...useful, world: world_ceiling(useful_state) }));
+	await give([...found("Progressive Auto Copy Speed", LOGIC.speed_progression - 3), ...found("Progressive Auto Copy Accuracy", LOGIC.accuracy_progression - 2), ...found("Progressive Auto Copy Accuracy", CONTRACT.accuracy_items - LOGIC.accuracy_progression, 2)]);
+	const every = await logic_now();
+	check("...and with every copy the ceiling reads, the start's color items among them, the ceiling is the whole logic percent", every.counted === `${colors},${colors},${colors},${widths},${heights},${LOGIC.speed_progression},${LOGIC.accuracy_progression},1` && Math.abs(every.ceiling - START_SLOT_DATA.logic_percent) < 1e-9, JSON.stringify({ ...every, logic_percent: START_SLOT_DATA.logic_percent }));
 
 	check("no page errors", page_errors.length === 0, page_errors.slice(0, 5).join(" | "));
 } catch (error) {

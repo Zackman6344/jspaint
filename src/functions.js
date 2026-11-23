@@ -7,7 +7,8 @@ import { $DialogWindow } from "./$ToolWindow.js";
 import { OnCanvasHelperLayer } from "./OnCanvasHelperLayer.js";
 import { OnCanvasSelection } from "./OnCanvasSelection.js";
 import { OnCanvasTextBox } from "./OnCanvasTextBox.js";
-import { deathlink, final_height, final_width, received, send, slotData, version_below } from "./archipelago.js";
+import { deathlink, final_height, final_width, progression_rungs, received, send, slotData, version_below } from "./archipelago.js";
+import { miss_percent } from "./misses.js";
 import { worst_error } from "./shades.js";
 // import { localize } from "./app-localization.js";
 import { default_palette } from "./color-data.js";
@@ -2181,18 +2182,29 @@ function calculate_similarity() {
 	return s;
 }
 
+// Logic's similarity ceiling as the world works it out (rules.py's percent_available(), D8): what auto copy gets right in
+// auto_copy_logic_hours, at your full color depth, plus the starting canvas by hand, at 2 bits at most without Pick
+// Color. A seed with auto copy out of logic, at 0 hours, or one from before Phase 5, with no hours in its slot data,
+// counts the whole unlocked canvas by hand, as upstream. It counts the copies progression_rungs() counts: those the
+// server marks progression, and the start inventory and cheat items it sends with flags 0. Speed copies past auto
+// copy's top tier, slot data's auto_copy_speed_items, count as the top tier, as auto-copy.js's top_tier() runs them.
 function calculate_logic_similarity() {
-	var items = received();
 	var table = slotData.shade_counts ?? [2];
 	// Logic assumes Paint's 2 bits at most without Pick Color: the last item count with a worst error of 31 or more.
 	var cap = table.length - 1;
-	if (!items.includes("Pick Color") && !items.includes("Progressive Pick Color")) while (cap > 0 && worst_error(table[cap]) < 31) cap--;
-	var error = (name) => worst_error(table[Math.min(items.filter(x => x == name).length, cap)]);
-	var r = error("Progressive Color Depth (Red)"), g = error("Progressive Color Depth (Green)"), b = error("Progressive Color Depth (Blue)");
-	var w = Math.min((slotData.start_width ?? final_width / 2) + items.filter(x => x == "Progressive Canvas Width").length * (slotData.canvas_width_increment ?? slotData.canvas_size_increment ?? 100), final_width);
-	var h = Math.min((slotData.start_height ?? final_height / 2) + items.filter(x => x == "Progressive Canvas Height").length * (slotData.canvas_height_increment ?? slotData.canvas_size_increment ?? 100), final_height);
-	var per_pixel = 1 - 2 * Math.sqrt((r * r + g * g + b * b) / 3) / 255; // worst case; r, g and b are worst errors here
-	return per_pixel * w * h * slotData.logic_percent / (final_width * final_height);
+	if (!progression_rungs("Pick Color") && !progression_rungs("Progressive Pick Color")) while (cap > 0 && worst_error(table[cap]) < 31) cap--;
+	var score = (limit) => {
+		var [r, g, b] = ["Red", "Green", "Blue"].map((channel) => worst_error(table[Math.min(progression_rungs(`Progressive Color Depth (${channel})`), limit)]));
+		return 1 - 2 * Math.sqrt((r * r + g * g + b * b) / 3) / 255; // worst case; r, g and b are worst errors here
+	};
+	var full = score(table.length - 1), by_hand = score(cap);
+	var start_w = slotData.start_width ?? final_width / 2, start_h = slotData.start_height ?? final_height / 2;
+	var w = Math.min(start_w + progression_rungs("Progressive Canvas Width") * (slotData.canvas_width_increment ?? slotData.canvas_size_increment ?? 100), final_width);
+	var h = Math.min(start_h + progression_rungs("Progressive Canvas Height") * (slotData.canvas_height_increment ?? slotData.canvas_size_increment ?? 100), final_height);
+	var area = w * h, hours = slotData.auto_copy_logic_hours ?? 0;
+	var copied = hours ? Math.min(area, 2 ** Math.min(progression_rungs("Progressive Auto Copy Speed"), slotData.auto_copy_speed_items ?? 10) * (1 - miss_percent(progression_rungs("Progressive Auto Copy Accuracy")) / 100) * hours * 3600) : 0;
+	var painted = hours ? Math.min(area, copied + start_w * start_h) : area;
+	return (full * copied + by_hand * (painted - copied)) * slotData.logic_percent / (final_width * final_height);
 }
 
 // Note: This function is part of the API.
