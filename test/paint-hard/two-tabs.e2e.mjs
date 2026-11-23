@@ -14,8 +14,9 @@ import { cdp, check, finish, ORIGIN, overclock_id, sleep } from "./harness.mjs";
 
 const FULL_COLOR = [];
 for (const channel of ["Red", "Green", "Blue"]) for (let k = 0; k < 254; k++) FULL_COLOR.push(`Progressive Color Depth (${channel})`);
-const SLOT = { final_width: 800, final_height: 600, start_width: 600, start_height: 450, canvas_width_increment: 100, canvas_height_increment: 100, logic_percent: 80, goal_percent: 80, matched_pixels: 0, shade_counts: Array.from({ length: 255 }, (_, k) => k + 2), auto_copy_speed_items: 10, overclock_seconds: 5, version: "1.0.0", trap_blacklist: [] };
-const ITEMS = ["Magnifier", "Brush", ...FULL_COLOR, ...Array(10).fill("Progressive Auto Copy Speed"), ...Array(100).fill("Overclock")];
+const SLOT = { final_width: 800, final_height: 600, start_width: 600, start_height: 450, canvas_width_increment: 100, canvas_height_increment: 100, logic_percent: 80, goal_percent: 80, matched_pixels: 0, shade_counts: Array.from({ length: 255 }, (_, k) => k + 2), auto_copy_speed_items: 10, overclock_seconds: 5, miss_margin_step: 1, version: "1.0.0", trap_blacklist: [] };
+// Every Phase 4 accuracy copy (D7), so auto copy paints every pixel right, as before misses.
+const ITEMS = ["Magnifier", "Brush", ...FULL_COLOR, ...Array(10).fill("Progressive Auto Copy Speed"), ...Array(9).fill("Progressive Auto Copy Accuracy"), ...Array(100).fill("Overclock")];
 // D25's default bank: 5 copies of each, 600 s that fill 10 s a minute.
 const BANK_SLOT = { ...SLOT, overclock_bank_size_step: 120, overclock_fill_speed_step: 2 };
 const BANK_ITEMS = [...ITEMS, ...Array(5).fill("Progressive Overclock Bank Size"), ...Array(5).fill("Progressive Overclock Fill Speed")];
@@ -90,7 +91,7 @@ const painted = () => {
 	for (let i = 0; i < data.length; i += 4) if (data[i] !== 255 || data[i + 1] !== 255 || data[i + 2] !== 255) n++;
 	return n;
 };
-const state = () => ({ hidden: document.hidden, running: window.paint_hard_auto_copy.running(), speed: window.paint_hard_auto_copy.speed(), bank: window.paint_hard_auto_copy.overclock_bank(), record: window.paint_hard_auto_copy.overclock_record?.() ?? null });
+const state = () => ({ hidden: document.hidden, running: window.paint_hard_auto_copy.running(), speed: window.paint_hard_auto_copy.speed(), margin: window.paint_hard_auto_copy.miss_margin(), bank: window.paint_hard_auto_copy.overclock_bank(), record: window.paint_hard_auto_copy.overclock_record?.() ?? null });
 
 try {
 	const a = await open_hidden_tab();
@@ -100,7 +101,8 @@ try {
 	await set_up(b, SLOT, ITEMS);
 	await sleep(1500);
 	const before = { a: await a(state), b: await b(state), painted_a: await a(painted), painted_b: await b(painted) };
-	check("both tabs are hidden, at 256 pixels a second, with 500 s of fillers", before.a.hidden && before.b.hidden && before.a.speed === 256 && before.b.speed === 256 && before.a.bank.filler === 500, json({ a: before.a, b: before.b }));
+	// A margin of 255 with no margin copies says the stand-in plays as a Phase 4 seed: one from before has none.
+	check("both tabs are hidden, at 256 pixels a second, with 500 s of fillers, in a Phase 4 seed", before.a.hidden && before.b.hidden && before.a.speed === 256 && before.b.speed === 256 && before.a.bank.filler === 500 && before.a.margin === 255 && before.b.margin === 255, json({ a: before.a, b: before.b }));
 
 	await a(shift_m);
 	await b(shift_m);

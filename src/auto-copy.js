@@ -6,11 +6,15 @@
 // Its top speed is 1 pixel a second, doubled by each Progressive Auto Copy Speed; the panel picks any speed up to it,
 // and M draws from the same allowance. Banked Overclock doubles auto copy's speed while it runs. Ctrl+Z undoes each
 // press of M in one step, and auto copy a minute at a time.
+// Auto copy and M miss (D7): 90% of the pixels they paint at the start come out a shade off, within the miss margin, until
+// Progressive Auto Copy Accuracy and Progressive Miss Margin items close the gap. One run of auto copy is one pass over
+// the canvas; Auto Copy Loop starts each next one by itself.
 
 import { calculate_logic_similarity, calculate_similarity, deselect, undoable, update_helper_layer } from "./functions.js";
 import { $G, get_icon_for_tool, get_rgba_from_color } from "./helpers.js";
 import { legalizeColor } from "./$ColorBox.js";
-import { final_height, final_width, rungs, send, session_name, slotData } from "./archipelago.js";
+import { final_height, final_width, game_changed, rungs, send, session_name, slotData } from "./archipelago.js";
+import { draws, land_chance, margin_ranges, miss_margin, miss_percent, miss_value, rolls_miss, seeded } from "./misses.js";
 import { quantize } from "./shades.js";
 
 const KEY = "m";
@@ -31,10 +35,12 @@ let connection_window = null;
 
 const pick_color_icon = () => get_icon_for_tool(get_tool_by_id("TOOL_PICK_COLOR"));
 const in_bounds = (element, { x, y }) => x >= 0 && y >= 0 && x < element.width && y < element.height;
-// Browsers that blur canvas reads against fingerprinting (Brave, Firefox's strict mode) can read a color back a step off,
-// so a channel within 1 of the target counts as matching. Alpha has to be exact.
-const close = (value, target) => value - target <= 1 && target - value <= 1;
-const matches = (data, i, red, green, blue) => close(data[i], red) && close(data[i + 1], green) && close(data[i + 2], blue) && data[i + 3] === 255;
+// Browsers that blur canvas reads against fingerprinting (Brave, Firefox's strict mode) can read a color back a step
+// off. The page checks for that as it loads, and again whenever a pixel auto copy or M just wrote reads back different
+// (D7). Only then may each channel be 1 off when a pixel is judged. Reads further off than that can't judge pixels.
+let read_noise = null; // where noise was found: "load" or "read-back", or null for none
+let reads_blocked = false;
+const BLOCKED = "Your browser blocks reading the canvas, which auto copy and M need. Allow canvas reads for this site.";
 const takes_text = (element) => element instanceof HTMLElement && (element.isContentEditable || element.matches("textarea, select, input:not([type=range], [type=button], [type=checkbox], [type=radio])"));
 const count_of = rungs;
 
@@ -78,6 +84,74 @@ function change_tier(step) {
 	const next = Math.max(0, Math.min(top_tier(), tier() + step));
 	chosen_tier = next === top_tier() ? TOP : next;
 	try { localStorage.setItem("pain-t-auto-copy-tier", String(chosen_tier)); } catch { }
+	update_panel();
+}
+
+// --- Misses, the miss margin, passes and pass orders (D7, D23) ---
+
+// Seeds from before Phase 4 have no accuracy, margin or Loop items to find, so auto copy never misses there and goes on
+// pass after pass until the canvas is done, as it did. Slot data names miss_margin_step from Phase 4 on.
+const before_misses = () => !!slotData.version && slotData.miss_margin_step === undefined;
+const miss_chance = () => (before_misses() ? 0 : miss_percent(count_of("Progressive Auto Copy Accuracy")));
+const margin = () => (before_misses() ? 0 : miss_margin(count_of("Progressive Miss Margin"), slotData.miss_margin_step ?? 1));
+// The Loop switch, the pass order you picked and the orders auto copy has seen are kept for each game, so a new game
+// starts with Loop on, and an order that arrived while the page was closed is picked as it opens. A write that storage
+// refuses is kept for as long as the page is open.
+const game_key = (what) => `pain-t-auto-copy-${what}:${session_name()}`;
+const unsaved = new Map();
+function load_text(key) {
+	if (unsaved.has(key)) return unsaved.get(key);
+	try { return localStorage.getItem(key) ?? ""; } catch { return ""; }
+}
+function save_text(key, text) {
+	try {
+		localStorage.setItem(key, text);
+		unsaved.delete(key);
+	} catch {
+		unsaved.set(key, text);
+	}
+}
+
+// Auto Copy Loop starts each next pass by itself, and starts a finished run again when the game reopens pixels. Its
+// switch in the panel turns it off, so you can rest between passes and let the Overclock bank fill.
+const has_loop = () => !before_misses() && count_of("Auto Copy Loop") >= 1;
+const loop_switch = () => load_text(game_key("loop")) !== "off";
+const loop_on = () => before_misses() || (has_loop() && loop_switch());
+
+function set_loop(on) {
+	save_text(game_key("loop"), on ? "on" : "off");
+	update_panel();
+}
+
+// Draws for misses, auto copy's and M's apart, so a test can seed each and get the same misses again.
+let auto_random = Math.random, m_random = Math.random;
+const miss_stats = { auto: { rolled: 0, missed: 0 }, m: { rolled: 0, missed: 0 } };
+
+// The pass orders of D23's second copies: the second Progressive Difference Mode paints the pixels furthest from the
+// goal first, and the second Progressive Pick Color the pixels it can make exactly right at your shades first. Top to
+// bottom stays on offer. An order that arrives is picked, worst first when both come at once. The orders seen in a game
+// only ever grow, so a moment with no items, before they come in or after a reconnect, makes none arrive again.
+const ORDER_NAMES = { top: "top to bottom", worst: "worst first", exact: "exact first" };
+const order_unlocked = (order) => order === "top" || (!!slotData.ladders && count_of(order === "worst" ? "Progressive Difference Mode" : "Progressive Pick Color") >= 2);
+
+function pass_order() {
+	const unlocked = Object.keys(ORDER_NAMES).filter(order_unlocked);
+	const seen = load_text(game_key("orders-seen")).split(",").filter(Boolean);
+	const arrived = unlocked.filter((order) => order !== "top" && !seen.includes(order));
+	if (arrived.length) {
+		save_text(game_key("orders-seen"), [...seen, ...arrived].join());
+		save_text(game_key("order"), arrived.includes("worst") ? "worst" : "exact");
+	}
+	const chosen = load_text(game_key("order"));
+	if (unlocked.includes(chosen)) return chosen;
+	return unlocked.includes("worst") ? "worst" : unlocked.includes("exact") ? "exact" : "top";
+}
+
+// The panel's order button picks one. A run that's going starts its pass again in the new order at its next tick, as it
+// does when an order arrives.
+function choose_order(order) {
+	if (!order_unlocked(order)) return;
+	save_text(game_key("order"), order);
 	update_panel();
 }
 
@@ -472,20 +546,22 @@ function each_pixel_on_line(a, b, callback) {
 }
 
 // Puts the goal's color at (x, y) into the same pixel of the canvas, rounded the way Pick Color rounds it, if the
-// allowance has a pixel left, and keeps the running total up to date. Returns "same" when it already matches, "wait"
-// when the allowance is empty, or "painted".
-function copy_pixel({ x, y }, bucket, [red_of, green_of, blue_of]) {
-	const [r, g, b] = goal_ctx.getImageData(x, y, 1, 1).data;
-	const red = red_of[r], green = green_of[g], blue = blue_of[b];
+// allowance has a pixel left, and keeps the running total up to date. M misses as auto copy does (D6). Returns "same"
+// when the pixel is already as good as your best shade, "wait" when the allowance is empty, "painted" or "missed".
+function copy_pixel({ x, y }, bucket, tables) {
+	const goal = goal_read(), at = (y * goal.width + x) * 4;
+	const gr = goal.data[at], gg = goal.data[at + 1], gb = goal.data[at + 2];
 	const pixel = main_ctx.getImageData(x, y, 1, 1);
-	if (matches(pixel.data, 0, red, green, blue)) return "same";
+	if (settled(pixel.data, 0, gr, gg, gb, tables)) return "same";
 	if (bucket.tokens < 1) return "wait";
 	bucket.tokens -= 1;
+	const [r, g, b] = attempt(gr, gg, gb, tables, m_random, miss_stats.m);
 	const [cr, cg, cb] = pixel.data;
-	scores.sum += pixel_score(red - r, green - g, blue - b) - pixel_score(cr - r, cg - g, cb - b);
-	pixel.data.set([red, green, blue, 255]);
+	scores.sum += pixel_score(r - gr, g - gg, b - gb) - pixel_score(cr - gr, cg - gg, cb - gb);
+	pixel.data.set([r, g, b, 255]);
 	main_ctx.putImageData(pixel, x, y);
-	return "painted";
+	last_write = { x, y, r, g, b };
+	return lands(r, g, b, gr, gg, gb, tables) ? "painted" : "missed";
 }
 
 // Changing the canvas mid-gesture is unsafe: if Paint cancels the gesture, it rolls back to where it started.
@@ -608,9 +684,11 @@ function queue(pixel) {
 
 function start_sweep(code) {
 	if (busy()) return show_status("Let go of the mouse first.");
+	if (reads_blocked) return show_status(BLOCKED);
 	if (sweep) end_sweep(true);
+	goal.data = null; // read the goal again at the first pixel, in case it changed
 	// filled_at starts where the allowance last filled, so time nothing was copying still counts, up to a second.
-	sweep = { ...new_progress(250, 500), code, last: null, pending: [], count: 0, first: null, seen: false, outside: false, skipped: 0, frame: 0, timer: 0, released: false, filled_at: (alongside() ? m_allowance : allowance).at };
+	sweep = { ...new_progress(250, 500), code, last: null, pending: [], count: 0, missed: 0, first: null, seen: false, outside: false, skipped: 0, frame: 0, timer: 0, released: false, filled_at: (alongside() ? m_allowance : allowance).at };
 	const pixel = pixel_under_cursor();
 	if (pixel) queue(pixel);
 	if (last_client) sweep.last = { canvas: position_on(main_canvas, last_client.clientX, last_client.clientY), goal: position_on(goal_canvas, last_client.clientX, last_client.clientY) };
@@ -669,6 +747,7 @@ function copy_pending() {
 	const tables = rounding_tables();
 	const deadline = now + 8; // a long line of pixels goes in over a few frames, so the page keeps drawing
 	let changed = 0, out_of_time = false;
+	last_write = null;
 	while (sweep.pending.length) {
 		if (performance.now() >= deadline) {
 			out_of_time = true;
@@ -677,11 +756,13 @@ function copy_pending() {
 		const result = copy_pixel(sweep.pending[0], bucket, tables);
 		if (result === "wait") break;
 		const pixel = sweep.pending.shift();
-		if (result === "painted") {
+		if (result === "painted" || result === "missed") {
 			changed++;
+			if (result === "missed") sweep.missed++;
 			sweep.first ??= pixel;
 		}
 	}
+	check_read_back(); // the last pixel M wrote should read back as written
 	if (changed) {
 		sweep.count += changed;
 		if (with_auto) {
@@ -695,6 +776,7 @@ function copy_pending() {
 			commit(sweep, sweep.count === 1 ? "Copy Goal Pixel" : "Copy Goal Pixels"); // one undo step per press
 		}
 	}
+	if (reads_blocked) throw new Error(BLOCKED); // M lets go and says why, its pixels so far in their undo step
 	return out_of_time;
 }
 
@@ -715,11 +797,11 @@ function end_sweep(drop) {
 
 function finish_sweep() {
 	catch_up(sweep, true);
-	const { count, first, seen, outside, skipped } = sweep;
+	const { count, missed, first, seen, outside, skipped } = sweep;
 	sweep = null;
 	const limit = skipped ? ` M copies ${speed().toLocaleString()} ${speed() === 1 ? "pixel" : "pixels"} a second at your speed, so ${skipped.toLocaleString()} passed over were left.` : "";
-	if (count === 1) show_status(`Copied ${first.x},${first.y} from the goal.${limit}`);
-	else if (count > 1) show_status(`Copied ${count.toLocaleString()} pixels from the goal.${limit}`);
+	if (count === 1) show_status(`Copied ${first.x},${first.y} from the goal${missed ? ", but missed" : ""}.${limit}`);
+	else if (count > 1) show_status(`Copied ${count.toLocaleString()} pixels from the goal${missed ? `, ${missed.toLocaleString()} of them missed` : ""}.${limit}`);
 	else if (skipped) show_status(`Nothing copied yet.${limit}`);
 	else if (outside) show_status(`That's past the edge of your canvas (${main_canvas.width}x${main_canvas.height}).`);
 	else show_status(seen ? "Already matches the goal." : "Point at the goal image or your canvas, then press M.");
@@ -729,40 +811,151 @@ function finish_sweep() {
 // Works through the canvas row by row and copies pixels that don't match yet, at the speed you pick.
 // Pixels that already match cost nothing, so a nearly finished canvas goes quicker, but never faster than the speed.
 
-let tables = null, tables_key = "", tables_for = null;
+let tables = null, tables_key = "", tables_for = null, tables_changed_at = 0;
 const one_pixel = new ImageData(1, 1);
+const STRIP = 16; // the canvas is read 16 rows at a time, from each multiple of 16
+
+// How many shades each channel has, from your Progressive Color Depth items.
+function shade_counts() {
+	const table = slotData.shade_counts ?? [2];
+	return ["Red", "Green", "Blue"].map((channel) => table[Math.min(count_of(`Progressive Color Depth (${channel})`), table.length - 1)]);
+}
 
 // Pick Color's rounding as one lookup table per channel: legalizeColor()'s quantize() at each channel's shade count,
-// rebuilt only when a Progressive Color Depth arrives. Four colors through legalizeColor() itself check that it still
-// rounds that way. legalizeColor() rounds what a 1x1 canvas reads back, which Brave's farbling can put a step off the
-// color written, so each is looked up at that read.
+// rebuilt only when a Progressive Color Depth or a Progressive Miss Margin arrives. Four colors through legalizeColor()
+// itself check that it still rounds that way. legalizeColor() rounds what a 1x1 canvas reads back, which Brave's
+// farbling can put a step off the color written, so each is looked up at that read. Beside each table: `best`, how far
+// each value is from its shade, squared, and `ranges`, the shades a miss can paint around each one (D7).
 function rounding_tables() {
 	const table = slotData.shade_counts ?? [2];
-	const shades = ["Red", "Green", "Blue"].map((channel) => table[Math.min(count_of(`Progressive Color Depth (${channel})`), table.length - 1)]);
-	const key = shades.join();
+	const shades = shade_counts();
+	const spread = margin(), key = `${shades.join()}/${spread}`;
 	if (key === tables_key && table === tables_for) return tables;
 	const built = shades.map((count) => Uint8Array.from({ length: 256 }, (_, value) => quantize(value, count)));
 	for (const rgb of [[12, 200, 77], [255, 128, 0], [90, 90, 250], [131, 7, 190]]) {
 		const color = `rgb(${rgb})`, read = get_rgba_from_color(color);
 		if (legalizeColor(color).match(/\d+/g).map(Number).some((value, channel) => value !== built[channel][read[channel]])) throw new Error("Pick Color's rounding has changed in this version of the game");
 	}
+	built.best = built.map((rounded) => Int32Array.from(rounded, (shade, value) => (shade - value) ** 2));
+	built.ranges = built.map((rounded) => margin_ranges(rounded, spread));
 	tables = built;
 	tables_key = key;
 	tables_for = table;
+	tables_changed_at = performance.now(); // a new shade can reopen pixels that were done, so count them again soon
 	return tables;
 }
 
-// How many pixels of the unlocked canvas don't match the goal yet, at your color depth.
-function count_left() {
-	const [red, green, blue] = rounding_tables();
-	const width = Math.min(main_canvas.width, goal_canvas.width), height = Math.min(main_canvas.height, goal_canvas.height);
-	const goal = goal_ctx.getImageData(0, 0, width, height).data, canvas = main_ctx.getImageData(0, 0, width, height).data;
-	let left = 0;
-	for (let i = 0; i < goal.length; i += 4) {
-		if (!matches(canvas, i, red[goal[i]], green[goal[i + 1]], blue[goal[i + 2]])) left++;
+// Whether a canvas pixel already scores at least as well as the best shade you can paint for its goal pixel, compared
+// exactly (D7). Shade sets aren't nested, so a pixel painted at an older depth may beat every shade you have now, and
+// then it's left alone. Where reads are noisy, each channel may be 1 off first. Alpha has to be exact.
+function settled(data, i, gr, gg, gb, { best }) {
+	if (data[i + 3] !== 255) return false;
+	let dr = Math.abs(data[i] - gr), dg = Math.abs(data[i + 1] - gg), db = Math.abs(data[i + 2] - gb);
+	if (read_noise) {
+		dr = Math.max(0, dr - 1);
+		dg = Math.max(0, dg - 1);
+		db = Math.max(0, db - 1);
 	}
+	return dr * dr + dg * dg + db * db <= best[0][gr] + best[1][gg] + best[2][gb];
+}
+
+// Whether a color just painted is as good as the best shade: a hit, though it may have been a miss that drew right.
+function lands(r, g, b, gr, gg, gb, { best }) {
+	return (r - gr) ** 2 + (g - gg) ** 2 + (b - gb) ** 2 <= best[0][gr] + best[1][gg] + best[2][gb];
+}
+
+// What auto copy or M paints for a goal pixel: the right shades, or on a miss one draw per channel within the margin.
+function attempt(gr, gg, gb, tables, random, stats) {
+	const r = tables[0][gr], g = tables[1][gg], b = tables[2][gb];
+	stats.rolled++;
+	if (!rolls_miss(miss_chance(), random)) return [r, g, b];
+	stats.missed++;
+	const [red, green, blue] = tables.ranges;
+	return [miss_value(red, r, random), miss_value(green, g, random), miss_value(blue, b, random)];
+}
+
+// The goal, read whole and kept, so every pixel is judged against the same read: in a browser whose reads are noisy, a
+// read of another size or place can come back different. It's read again as auto copy starts and at each pass, at each
+// count of the pixels left, as M starts, and when a new goal loads.
+const goal = { data: null, width: 0, height: 0 };
+function read_goal() {
+	goal.width = goal_canvas.width;
+	goal.height = goal_canvas.height;
+	goal.data = goal_ctx.getImageData(0, 0, goal.width, goal.height).data;
+	return goal;
+}
+const goal_read = () => (goal.data && goal.width === goal_canvas.width && goal.height === goal_canvas.height ? goal : read_goal());
+
+// The last pixel auto copy or M wrote, read back in the same task: nothing else can have changed it, so a difference is
+// read noise. A step off turns on the 1-level tolerance until the page reloads; further off, reads can't judge pixels.
+let last_write = null;
+function check_read_back() {
+	if (!last_write || read_noise || reads_blocked) return;
+	const { x, y, r, g, b } = last_write;
+	const back = main_ctx.getImageData(x, y, 1, 1).data;
+	const off = Math.max(Math.abs(back[0] - r), Math.abs(back[1] - g), Math.abs(back[2] - b));
+	if (off > 1) reads_blocked = true;
+	else if (off === 1) read_noise = "read-back";
+	last_write = null;
+}
+
+// As the page loads: three patterns written to a small canvas and read back. Exact means reads are clean, a step off
+// means noise, and further off means reads are blocked.
+function probe_reads() {
+	const probe = document.createElement("canvas");
+	probe.width = probe.height = 16;
+	const context = probe.getContext("2d", { willReadFrequently: true });
+	let off = 0;
+	try {
+		for (let round = 0; round < 3; round++) {
+			const image = context.createImageData(16, 16);
+			for (let i = 0; i < image.data.length; i += 4) image.data.set([(i * 7 + round * 61) % 256, (i * 13 + 40 + round * 17) % 256, (i * 29 + 90 + round * 101) % 256, 255], i);
+			context.putImageData(image, 0, 0);
+			const back = context.getImageData(0, 0, 16, 16).data;
+			for (let i = 0; i < back.length; i++) off = Math.max(off, Math.abs(back[i] - image.data[i]));
+		}
+	} catch {
+		off = 256;
+	}
+	if (off > 1) reads_blocked = true;
+	else if (off === 1) read_noise = "load";
+}
+
+// How many pixels of the unlocked canvas aren't yet as good as your best shade, at your color depth. The canvas is read
+// in the strips the scan reads: in a browser whose reads are noisy, a read of another size or place can come back
+// different, and a pixel the count calls off that the scan calls done would keep a Loop run going with nothing to paint.
+// Beside the count, how many tries those pixels should take at your miss chance, for the time left.
+let tries_per_pixel = 1;
+function count_left() {
+	const tables = rounding_tables(), goal = read_goal(), chance = miss_chance();
+	const width = Math.min(main_canvas.width, goal.width), height = Math.min(main_canvas.height, goal.height);
+	const [red, green, blue] = tables.ranges;
+	let left = 0, tries = 0;
+	for (let top = 0; top < height; top += STRIP) {
+		const rows = Math.min(STRIP, height - top), canvas = main_ctx.getImageData(0, top, width, rows).data;
+		for (let y = top; y < top + rows; y++) {
+			for (let x = 0, i = (y - top) * width * 4, at = y * goal.width * 4; x < width; x++, i += 4, at += 4) {
+				const gr = goal.data[at], gg = goal.data[at + 1], gb = goal.data[at + 2];
+				if (settled(canvas, i, gr, gg, gb, tables)) continue;
+				left++;
+				tries += 1 / land_chance(chance, draws(red, tables[0][gr]) * draws(green, tables[1][gg]) * draws(blue, tables[2][gb]));
+			}
+		}
+	}
+	tries_per_pixel = left ? tries / left : 1;
 	return left;
 }
+
+// A pass's sweeps, each over the whole canvas from the top, painting the pixels its test picks (D23). Top to bottom is
+// one sweep. Exact first sweeps first for the pixels whose goal color is one of your shades in all three channels.
+// Worst first sweeps 8 times, from the pixels furthest from the goal, each a band of 32 levels of distance.
+const exactable = (gr, gg, gb, [red, green, blue]) => red[gr] === gr && green[gg] === gg && blue[gb] === gb;
+const band = (data, i, gr, gg, gb) => Math.min(7, Math.floor(Math.sqrt(((data[i] - gr) ** 2 + (data[i + 1] - gg) ** 2 + (data[i + 2] - gb) ** 2) / 3) / 32));
+const SWEEPS = {
+	top: [() => true],
+	exact: [(data, i, gr, gg, gb, tables) => exactable(gr, gg, gb, tables), (data, i, gr, gg, gb, tables) => !exactable(gr, gg, gb, tables)],
+	worst: [7, 6, 5, 4, 3, 2, 1, 0].map((level) => (data, i, gr, gg, gb) => band(data, i, gr, gg, gb) === level),
+};
 
 // Why auto copy should hold off right now, or "" to carry on.
 function waiting_reason(now) {
@@ -804,37 +997,57 @@ function auto_tick() {
 			if (late || (elapsed >= banked && from_fillers > 0)) overclock_save();
 		}
 		fill_allowance(allowance, speed() * (elapsed > 0 ? 1 + boosted / elapsed : 1), elapsed, elapsed);
-		const [red, green, blue] = rounding_tables();
-		const width = Math.min(main_canvas.width, goal_canvas.width), height = Math.min(main_canvas.height, goal_canvas.height);
+		const tables = rounding_tables(), goal = goal_read();
+		const width = Math.min(main_canvas.width, goal.width), height = Math.min(main_canvas.height, goal.height);
+		// An order you picked, or one that arrived, starts the pass again in that order. In exact first so do new shades,
+		// which change the pixels it can make exactly right; shade sets aren't nested.
+		const order = pass_order(), shades = shade_counts().join();
+		if (order !== auto.order || (order === "exact" && shades !== auto.shades)) Object.assign(auto, { order, sweep: 0, x: 0, y: 0 });
+		auto.shades = shades;
 		// Counted from here, after any rescore above, so a late tick in a throttled tab still gets its time to paint.
 		const deadline = performance.now() + (elapsed > 1 ? 100 : 8);
-		let budget = Math.floor(allowance.tokens), painted = 0, finished = false;
+		let budget = Math.floor(allowance.tokens), painted = 0, hits = 0, finished = false, pass_over = false;
+		let sweeps = SWEEPS[auto.order] ?? SWEEPS.top;
+		last_write = null;
 		while (budget > 0 && performance.now() < deadline) {
 			if (auto.y >= height) {
-				// End of a pass. Another pass catches pixels changed behind the scan by traps, undo or your own strokes.
 				auto.y = auto.x = 0;
-				if (auto.pass_painted === 0 && count_left() === 0) {
+				if (++auto.sweep < sweeps.length) continue; // the pass's next sweep
+				// End of a pass. The next one paints the pixels missed, and pixels changed behind the scan by traps, undo or
+				// your own strokes.
+				auto.sweep = 0;
+				auto.left = count_left();
+				auto.counted_at = now;
+				hits = 0; // counted in already
+				if (auto.left === 0) {
 					finished = true;
 					break;
 				}
-				auto.pass_painted = 0;
+				if (!loop_on()) {
+					pass_over = true;
+					break;
+				}
+				auto.pass++;
+				auto.order = pass_order();
+				sweeps = SWEEPS[auto.order];
 				continue;
 			}
-			const top = auto.y, rows = Math.min(16, height - top);
-			const goal = goal_ctx.getImageData(0, top, width, rows).data;
+			const top = auto.y - auto.y % STRIP, rows = Math.min(STRIP, height - top); // the strip count_left() reads
 			const canvas = main_ctx.getImageData(0, top, width, rows).data;
+			const picks = sweeps[auto.sweep];
 			while (budget > 0 && auto.y < top + rows) {
-				const row = (auto.y - top) * width;
+				const row = (auto.y - top) * width, goal_row = auto.y * goal.width;
 				for (; auto.x < width && budget > 0; auto.x++) {
-					const i = (row + auto.x) * 4;
-					const gr = goal[i], gg = goal[i + 1], gb = goal[i + 2];
-					const r = red[gr], g = green[gg], b = blue[gb];
-					if (matches(canvas, i, r, g, b)) continue;
+					const i = (row + auto.x) * 4, at = (goal_row + auto.x) * 4;
+					const gr = goal.data[at], gg = goal.data[at + 1], gb = goal.data[at + 2];
+					if (settled(canvas, i, gr, gg, gb, tables) || !picks(canvas, i, gr, gg, gb, tables)) continue;
+					const [r, g, b] = attempt(gr, gg, gb, tables, auto_random, miss_stats.auto);
 					scores.sum += pixel_score(r - gr, g - gg, b - gb) - pixel_score(canvas[i] - gr, canvas[i + 1] - gg, canvas[i + 2] - gb);
 					one_pixel.data.set([r, g, b, 255]);
 					main_ctx.putImageData(one_pixel, auto.x, auto.y);
+					last_write = { x: auto.x, y: auto.y, r, g, b };
+					if (lands(r, g, b, gr, gg, gb, tables)) hits++;
 					painted++;
-					auto.pass_painted++;
 					budget--;
 				}
 				if (auto.x >= width) {
@@ -843,6 +1056,8 @@ function auto_tick() {
 				}
 			}
 		}
+		check_read_back(); // the last pixel this tick wrote should read back as written
+		if (reads_blocked) throw new Error(BLOCKED);
 		allowance.tokens -= painted;
 		if (painted) {
 			if (auto.node && now - auto.node_started > STEP_SECONDS * 1000) {
@@ -854,10 +1069,11 @@ function auto_tick() {
 			// A new step's minute starts where its first tick's time did, so a long gap (a throttled tab) can't stretch it to two.
 			if (auto.node !== node) auto.node_started = now - elapsed * 1000;
 			auto.seen_node = current_history_node; // our own step isn't a change to wait for
-			auto.left = Math.max(0, auto.left - painted);
+			auto.left = Math.max(0, auto.left - hits);
 		}
 		if (finished) return finish_auto();
-		if (now - auto.counted_at > 2000) {
+		if (pass_over) return end_pass();
+		if (now - auto.counted_at > 2000 || auto.counted_at < tables_changed_at) {
 			auto.left = count_left();
 			auto.counted_at = now;
 		}
@@ -868,20 +1084,26 @@ function auto_tick() {
 	}
 }
 
-function start_auto() {
+// Starts a run, resumes a paused one, or after a pass that ended without Loop starts the next pass at the top. A run
+// Loop starts again waits 3 s first, as auto copy does after any change it didn't make, so Ctrl+Z can still walk back
+// past the trap that reopened pixels.
+function start_auto(by_loop = false) {
 	if (auto?.running) return;
+	if (reads_blocked) return update_panel(BLOCKED);
 	let left;
 	try {
 		left = count_left();
 	} catch (error) {
 		return update_panel(`Can't start: ${error.message}`);
 	}
-	if (!auto || auto.done) auto = { ...new_progress(1000, SEND_EVERY_MS), x: 0, y: 0, pass_painted: 0, node_started: 0, done: false, waiting: "" };
+	const pass_start = { x: 0, y: 0, sweep: 0, order: pass_order(), shades: shade_counts().join(), pass_ended: false };
+	if (!auto || auto.done) auto = { ...new_progress(1000, SEND_EVERY_MS), ...pass_start, pass: 1, node_started: 0, done: false, waiting: "" };
+	else if (auto.pass_ended) Object.assign(auto, pass_start, { pass: auto.pass + 1 });
 	auto.left = left;
 	auto.counted_at = performance.now();
 	auto.seen_node = current_history_node;
 	auto.seen_changes = history_changes;
-	auto.moved_at = -Infinity;
+	auto.moved_at = by_loop ? performance.now() : -Infinity;
 	scores.valid = false; // the canvas may have changed while auto copy was stopped
 	panel.message = "";
 	if (left === 0) return finish_auto();
@@ -905,6 +1127,19 @@ function finish_auto() {
 	pause_auto();
 	auto.done = true;
 	auto.left = 0;
+	auto.game_state = game_state(); // with Loop on, the game reopening pixels after this starts a new run
+	auto.left_at_count = 0;
+	update_panel();
+}
+
+// What the game changes that can reopen pixels: your shades, the canvas's size, and how many traps and DeathLink resets
+// have changed the canvas.
+const game_state = () => `${shade_counts().join()}/${main_canvas.width}x${main_canvas.height}/${game_changed()}`;
+
+// A pass ended with pixels still off, and Loop isn't on: the run stops there, and Start begins the next pass.
+function end_pass() {
+	pause_auto();
+	auto.pass_ended = true;
 	update_panel();
 }
 
@@ -926,12 +1161,12 @@ function seconds_text(seconds) {
 	return seconds < 120 ? `${Math.floor(seconds)} s` : minutes_text(seconds).replace("about ", "");
 }
 
-// Seconds auto copy needs for `left` pixels at `pixels` a second. Banked Overclock doubles the first stretch, and the
-// bank doesn't fill while auto copy runs (D25). The same whether auto copy runs, waits or is paused, but for what the bank
-// fills while it's paused.
-function time_left(left, pixels, banked) {
-	if (left <= 2 * pixels * banked) return left / (2 * pixels);
-	return banked + (left - 2 * pixels * banked) / pixels;
+// Seconds auto copy needs for `tries` at `pixels` a second: with misses, a pixel takes more than one. Banked Overclock
+// doubles the first stretch, and the bank doesn't fill while auto copy runs (D25). The same whether auto copy runs, waits
+// or is paused, but for what the bank fills while it's paused.
+function time_left(tries, pixels, banked) {
+	if (tries <= 2 * pixels * banked) return tries / (2 * pixels);
+	return banked + (tries - 2 * pixels * banked) / pixels;
 }
 
 function open_panel() {
@@ -952,20 +1187,41 @@ function open_panel() {
 	const faster = make("button", { textContent: "+", title: "Faster" }, { minWidth: "26px" });
 	const speed_text = make("span", {}, { marginLeft: "4px", whiteSpace: "nowrap" });
 	const tier_text = make("div", {}, { margin: "0 0 4px", whiteSpace: "normal" });
+	const misses_text = make("div", {}, { margin: "0 0 4px", whiteSpace: "normal" });
 	const overclock_text = make("div", {}, { margin: "0 0 10px", whiteSpace: "normal" });
+	// Switches as buttons too, for the same reason: Loop, and the pass order once a second copy of D23 gives one.
+	const switch_row = make("div", {}, { display: "flex", flexWrap: "wrap", gap: "4px", marginBottom: "8px" });
+	const loop_button = make("button", { title: "Auto Copy Loop starts each next pass by itself" });
+	const order_button = make("button", { title: "The order auto copy paints a pass in" });
 	const button = make("button", {}, { minWidth: "90px" });
 	speed_row.append(slower, faster, speed_text);
-	$w.$content.css({ padding: "8px 10px 10px", width: 250 }).append(state, progress, speed_row, tier_text, overclock_text, button);
+	switch_row.append(loop_button, order_button);
+	$w.$content.css({ padding: "8px 10px 10px", width: 250 }).append(state, progress, speed_row, tier_text, misses_text, overclock_text, switch_row, button);
 	slower.addEventListener("click", () => change_tier(-1));
 	faster.addEventListener("click", () => change_tier(1));
+	loop_button.addEventListener("click", () => set_loop(!loop_switch()));
+	order_button.addEventListener("click", () => {
+		const unlocked = Object.keys(ORDER_NAMES).filter(order_unlocked);
+		choose_order(unlocked[(unlocked.indexOf(pass_order()) + 1) % unlocked.length]);
+	});
 	button.addEventListener("click", toggle_auto);
-	// While stopped, keep the count honest: a trap, a canvas size item or a new goal changes it after "Done".
+	// While stopped, keep the count honest: a trap, a canvas size item or a new goal changes it after "Done". With Loop
+	// on, a run that finished starts again when the game reopens pixels: the count rose since the last one, and a color
+	// or canvas item, a trap or a DeathLink reset came in between. Your own changes don't, so a canvas you clear or paint
+	// by hand stays as you left it until then, and a run you paused stays paused.
 	const recount = setInterval(() => {
-		if (!auto || auto.running || document.hidden) return update_panel();
+		const finished_with_loop = !!auto?.done && has_loop() && loop_switch();
+		if (!auto || auto.running || (document.hidden && !finished_with_loop)) return update_panel();
 		try {
 			const left = count_left();
 			if (left !== auto.left) auto.left = left;
 		} catch { } // rounding_tables() can throw; Start shows why
+		if (auto.done) {
+			const state = game_state();
+			if (finished_with_loop && state !== auto.game_state && auto.left > auto.left_at_count) return start_auto(true);
+			auto.game_state = state;
+			auto.left_at_count = auto.left;
+		}
 		update_panel();
 	}, 2000);
 	$w.onClosed(() => {
@@ -979,7 +1235,7 @@ function open_panel() {
 			if (takes_text(focused) && focused.closest(".window")) focused.blur();
 		});
 	});
-	panel = { $w, state, progress, speed_text, tier_text, overclock_text, slower, faster, button, message: "" };
+	panel = { $w, state, progress, speed_text, tier_text, misses_text, overclock_text, switch_row, loop_button, order_button, slower, faster, button, message: "" };
 	const area = $canvas_area[0].getBoundingClientRect();
 	$w.css({ left: Math.max(0, area.right - $w.outerWidth() - 24), top: area.top + 12 });
 	update_panel();
@@ -988,7 +1244,7 @@ function open_panel() {
 function update_panel(message) {
 	if (!panel) return;
 	if (message !== undefined) panel.message = message;
-	const { state, progress, speed_text, tier_text, overclock_text, slower, faster, button } = panel;
+	const { state, progress, speed_text, tier_text, misses_text, overclock_text, switch_row, loop_button, order_button, slower, faster, button } = panel;
 	const pixels = speed(), top = top_tier(), banked = overclock_banked();
 	const copying = !!auto?.running && !auto.waiting;
 	// Overclocked while auto copy copies with seconds banked. The bank doesn't fill while it runs, so once they run out the
@@ -1006,16 +1262,33 @@ function update_panel(message) {
 	].filter(Boolean).join(" ");
 	slower.disabled = tier() === 0;
 	faster.disabled = tier() >= top;
+	const miss = miss_chance(), spread = margin();
+	misses_text.textContent = before_misses() ? "" : [
+		miss === 0 ? "Never misses."
+			: spread === 0 ? `Misses ${miss}% of pixels, but at margin 0 a miss paints the right shade anyway.`
+			: `Misses ${miss}% of pixels: a miss paints a shade within ${spread} of the right one.`,
+		read_noise ? "Your browser reads colors back a step off, so a pixel within 1 of your best shade counts as done." : "",
+	].filter(Boolean).join(" ");
+	const order = pass_order(), orders = Object.keys(ORDER_NAMES).filter(order_unlocked);
+	// Shown or hidden through display, since a stylesheet's display for buttons would win over the hidden attribute.
+	loop_button.style.display = has_loop() ? "" : "none";
+	loop_button.textContent = `Loop: ${loop_switch() ? "on" : "off"}`;
+	order_button.style.display = orders.length > 1 ? "" : "none";
+	order_button.textContent = `Order: ${ORDER_NAMES[order]}`;
+	switch_row.style.display = has_loop() || orders.length > 1 ? "flex" : "none";
+	const left_text = `${(auto?.left ?? 0).toLocaleString()} ${auto?.left === 1 ? "pixel" : "pixels"}`;
 	state.textContent = panel.message
-		|| (!auto ? "Ready."
-			: auto.running ? auto.waiting || "Copying."
+		|| (reads_blocked ? BLOCKED
+			: !auto ? "Ready."
+			: auto.running ? auto.waiting || (auto.pass > 1 ? `Copying, pass ${auto.pass}.` : "Copying.")
 			: auto.done && auto.left === 0 ? "Done: your canvas matches the goal."
 			: auto.done ? "Ready."
+			: auto.pass_ended ? `Pass ${auto.pass} done: ${left_text} still off.`
 			: "Paused.");
 	progress.textContent = !auto ? "Copies the goal into your canvas, a row at a time."
 		: auto.left === 0 ? "Nothing left to copy on the canvas you've unlocked."
-		: `${auto.left.toLocaleString()} ${auto.left === 1 ? "pixel" : "pixels"} left, ${minutes_text(time_left(auto.left, pixels, banked))}.`;
-	button.textContent = auto?.running ? "Pause" : !auto || auto.done ? "Start" : "Resume";
+		: `${left_text} left, ${minutes_text(time_left(auto.left * tries_per_pixel, pixels, banked))}.`;
+	button.textContent = auto?.running ? "Pause" : !auto || auto.done ? "Start" : auto.pass_ended ? `Start pass ${auto.pass + 1}` : "Resume";
 }
 
 // Extras > Auto Copy: opens the panel, or brings it to the front.
@@ -1112,7 +1385,11 @@ function init() {
 		history_changes++;
 		scores.valid = false;
 	});
-	$G.on("save-goal", () => { scores.valid = false; });
+	$G.on("save-goal", () => {
+		scores.valid = false;
+		goal.data = null; // read the new goal before it's judged against
+	});
+	probe_reads();
 	window.jspaintCopyGoal = {
 		get enabled() { return enabled; },
 		toggle() { set_enabled(!enabled); },
@@ -1135,6 +1412,22 @@ function init() {
 		},
 		rounding_tables,
 		running: () => !!auto?.running,
+		// Misses and passes (D7, D23). seed_random gives auto copy and M seeded draws, so a run's misses repeat.
+		seed_random: (seed) => {
+			auto_random = seeded(seed);
+			m_random = seeded(seed + 1);
+			for (const stats of Object.values(miss_stats)) Object.assign(stats, { rolled: 0, missed: 0 });
+		},
+		miss_chance,
+		miss_margin: margin,
+		miss_stats: () => ({ auto: { ...miss_stats.auto }, m: { ...miss_stats.m } }),
+		loop: loop_on,
+		set_loop,
+		order: pass_order,
+		choose_order,
+		pass: () => ({ number: auto?.pass ?? 0, running: !!auto?.running, ended: !!auto?.pass_ended, done: !!auto?.done, sweep: auto?.sweep ?? 0 }),
+		pixels_left: count_left,
+		read_noise: () => (reads_blocked ? "blocked" : read_noise),
 	};
 }
 

@@ -65,10 +65,7 @@ $("<button>Connect!</button>").on("click", function () {
 			select_tool(default_tool);
 			if (slotData.death_link) {
 				client.deathLink.enableDeathLink();
-				client.deathLink.on("deathReceived", function () {
-					reset_canvas_and_history();
-					update();
-				});
+				client.deathLink.on("deathReceived", death_received);
 			}
 			if (slotData.trap_link) {
 				client.updateTags(client.arguments.tags.concat(["TrapLink"]));
@@ -195,6 +192,20 @@ function received() {
 	return received_items().names.slice();
 }
 
+// Changes the game makes to the canvas, not the player: traps that change it, and DeathLink resets. With Auto Copy Loop on,
+// auto copy starts a finished run again when one of these, a color item or a canvas item reopens pixels (D7). Each is
+// counted before it runs, since the change can throw as it sends checks while disconnected.
+var game_changes = 0;
+function game_changed() {
+	return game_changes;
+}
+
+function death_received() {
+	game_changes++;
+	reset_canvas_and_history();
+	update();
+}
+
 function handleTrap(name, isLinked, packet) {
 	if (isLinked) {
 		if (recent_traps[packet.source] && recent_traps[packet.source].trap_name == name && packet.time - recent_traps[packet.source].time < 1000) {
@@ -210,6 +221,7 @@ function handleTrap(name, isLinked, packet) {
 		case "Reverse Trap":
 		case "Whoops! Trap":
 			if (!slotData.death_link && (!slotData.trap_blacklist || !slotData.trap_blacklist.includes("Undo Trap"))) {
+				game_changes++;
 				undo();
 			}
 			break;
@@ -219,6 +231,7 @@ function handleTrap(name, isLinked, packet) {
 		case "Instant Death Trap":
 		case "One Hit KO":
 			if (!slotData.death_link && (!slotData.trap_blacklist || !slotData.trap_blacklist.includes("Clear Image Trap"))) {
+				game_changes++;
 				clear();
 			}
 			break;
@@ -226,6 +239,7 @@ function handleTrap(name, isLinked, packet) {
 		case "Chaos Trap":
 		case "Spooky Time":
 			if (!slotData.trap_blacklist || !slotData.trap_blacklist.includes("Invert Colors Trap")) {
+				game_changes++;
 				image_invert_colors();
 			}
 			break;
@@ -233,6 +247,7 @@ function handleTrap(name, isLinked, packet) {
 		case "Flip Trap":
 		case "Mirror Trap":
 			if (!slotData.trap_blacklist || !slotData.trap_blacklist.includes("Flip Horizontal Trap")) {
+				game_changes++;
 				flip_horizontal();
 			}
 			break;
@@ -240,6 +255,7 @@ function handleTrap(name, isLinked, packet) {
 		case "Camera Rotate Trap":
 		case "Screen Flip Trap":
 			if (!slotData.trap_blacklist || !slotData.trap_blacklist.includes("Flip Vertical Trap")) {
+				game_changes++;
 				flip_vertical();
 			}
 			break;
@@ -414,5 +430,5 @@ function version_below(version) {
 	return false;
 }
 
-export { deathlink, fake_session, final_height, final_width, mode_unlocked, received, rungs, send, session_name, show_text_client, slotData, version_below };
+export { death_received, deathlink, fake_session, final_height, final_width, game_changed, handleTrap, mode_unlocked, received, rungs, send, session_name, show_text_client, slotData, version_below };
 

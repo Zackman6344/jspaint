@@ -10,7 +10,10 @@ import { call, check, evaluate, finish, keyboard, mouse, open_paint, overclock_i
 const FULL_COLOR = [];
 for (const channel of ["Red", "Green", "Blue"]) for (let k = 0; k < 254; k++) FULL_COLOR.push(`Progressive Color Depth (${channel})`);
 const speed_items = (n) => Array(n).fill("Progressive Auto Copy Speed");
-const SLOT_DATA = { final_width: 800, final_height: 600, start_width: 600, start_height: 450, canvas_width_increment: 100, canvas_height_increment: 100, logic_percent: 80, goal_percent: 80, matched_pixels: 0, shade_counts: Array.from({ length: 255 }, (_, k) => k + 2), auto_copy_speed_items: 10, overclock_seconds: 2, version: "1.0.0", trap_blacklist: [] };
+// Phase 4's items (D7): with every accuracy copy auto copy and M never miss, and Auto Copy Loop runs pass after pass
+// until the canvas is done, as these checks expect. misses.e2e.mjs tests misses, the margin and passes.
+const SURE = [...Array(9).fill("Progressive Auto Copy Accuracy"), "Auto Copy Loop"];
+const SLOT_DATA = { final_width: 800, final_height: 600, start_width: 600, start_height: 450, canvas_width_increment: 100, canvas_height_increment: 100, logic_percent: 80, goal_percent: 80, matched_pixels: 0, shade_counts: Array.from({ length: 255 }, (_, k) => k + 2), auto_copy_speed_items: 10, overclock_seconds: 2, miss_margin_step: 1, version: "1.0.0", trap_blacklist: [] };
 // Sets the received items. Canvas items aren't used: the test sizes the canvas itself, as a partly unlocked game.
 // SLOT_DATA has no ladders flag, so both views and Pick Color work as upstream's do; no real seed pairs that with speed
 // items, and section 17 tests a real Phase 2 seed's slot data.
@@ -20,7 +23,7 @@ const receive = (items, slot_data = SLOT_DATA) => evaluate(async (slot_data, ite
 	const width = main_canvas.width, height = main_canvas.height;
 	fake_session(slot_data, ["Magnifier", "Brush", ...items]);
 	resize_canvas_without_saving_dimensions(width, height);
-}, slot_data, items);
+}, slot_data, [...items, ...SURE]);
 
 try {
 	await open_paint(() => typeof goal_canvas !== "undefined" && main_canvas.width > 0 && !!window.paint_hard_auto_copy);
@@ -37,7 +40,7 @@ try {
 		for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) image.data.set([(x * 3 + y) % 256, (y * 2 + 50) % 256, (x + y * 3) % 256, 255], (y * width + x) * 4);
 		goal_ctx.putImageData(image, 0, 0);
 		functions.set_magnification(1);
-	}, SLOT_DATA, [...FULL_COLOR, ...speed_items(10)]);
+	}, SLOT_DATA, [...FULL_COLOR, ...speed_items(10), ...SURE]);
 	await sleep(300);
 
 	const canvas_px = (x, y) => evaluate((x, y) => Array.from(main_ctx.getImageData(x, y, 1, 1).data), x, y);
@@ -347,11 +350,17 @@ try {
 	check("a 30x20 canvas gets finished", wrong === 0, `${wrong} of 600 pixels wrong`);
 	check("...and the panel says done", /^Done: your canvas matches the goal\./.test(await panel_text() || ""), await panel_text());
 	check("the top speed is remembered as the top", (await evaluate(() => localStorage.getItem("pain-t-auto-copy-tier"))) === "99", await evaluate(() => localStorage.getItem("pain-t-auto-copy-tier")));
+	// The next check is about Auto Copy Loop's restart, which a seed from before Phase 4 doesn't have. SURE carries no
+	// margin copy, so the stand-in's margin is 255 only while its slot data names miss_margin_step.
+	const phase4 = await evaluate(() => ({ margin: window.paint_hard_auto_copy.miss_margin(), loop: window.paint_hard_auto_copy.loop() }));
+	check("the stand-in plays as a Phase 4 seed: its margin is 255, with Loop on", phase4.margin === 255 && phase4.loop, JSON.stringify(phase4));
 	await call("clear");
 	await sleep(2500);
 	check('"Done" goes away when something undoes the work', /^Ready\. [\d,]+ pixels left/.test(await panel_text() || ""), await panel_text());
 
-	// 13. With blurred canvas reads (Brave, Firefox strict mode) it still finishes.
+	// 13. With blurred canvas reads (Brave, Firefox strict mode) it still finishes. The blur starts after the page loaded,
+	// so the page finds it when a pixel auto copy wrote reads back a step off (D7).
+	const noise_before = await evaluate(() => window.paint_hard_auto_copy.read_noise());
 	await evaluate(() => {
 		const original = CanvasRenderingContext2D.prototype.getImageData;
 		window.original_get_image_data = original;
@@ -365,6 +374,8 @@ try {
 	await keyboard.press("m", ["Shift"]);
 	for (let i = 0; i < 100 && !/^Done/.test(await panel_text() || ""); i++) await sleep(150);
 	check("with blurred canvas reads it still finishes", /^Done: your canvas matches the goal\./.test(await panel_text() || ""), await panel_text());
+	const noise_after = await evaluate(() => window.paint_hard_auto_copy.read_noise());
+	check("...having found the blur when a pixel it wrote read back a step off", noise_before === null && noise_after === "read-back", `${noise_before} before, ${noise_after} after`);
 	await evaluate(() => { CanvasRenderingContext2D.prototype.getImageData = window.original_get_image_data; });
 
 	// 14. Closing the panel stops auto copy.
@@ -496,9 +507,39 @@ try {
 	check("1,024 a second on 800x600 keeps to the speed", rate > 950 && rate <= 1040, `${rate.toFixed(0)}/s over ${seconds.toFixed(1)} s`);
 	check("...and the page keeps drawing frames", timing.frames > seconds * 30 && timing.max < 250, JSON.stringify(timing));
 	await keyboard.press("m", ["Shift"]);
+	// The same in D23's pass orders, 5 s each in a seed with the ladders: worst first sweeps the canvas once for each of
+	// its 8 bands of distance, and exact first twice.
+	await receive([...FULL_COLOR, ...speed_items(10), "Progressive Pick Color", "Progressive Difference Mode", "Progressive Similarity Mode", "Progressive Pick Color", "Progressive Difference Mode"], { ...SLOT_DATA, ladders: true });
+	const by_order = {};
+	for (const order of ["worst", "exact"]) {
+		await evaluate((order) => window.paint_hard_auto_copy.choose_order(order), order);
+		await call("clear");
+		await focus_page();
+		await keyboard.press("m", ["Shift"]);
+		await sleep(1500); // past the first full score
+		await evaluate(() => {
+			window.frame_gaps = [];
+			window.long_tasks = [];
+			let last = performance.now();
+			const frame = (now) => { window.frame_gaps.push(now - last); last = now; if (window.timing_on) requestAnimationFrame(frame); };
+			window.timing_on = true;
+			requestAnimationFrame(frame);
+		});
+		const q0 = await painted(), from = Date.now();
+		await sleep(5000);
+		const q1 = await painted(), took = (Date.now() - from) / 1000;
+		const gaps = await evaluate(() => {
+			window.timing_on = false;
+			const sorted = [...window.frame_gaps].sort((a, b) => a - b);
+			return { frames: sorted.length, max: Math.round(sorted[sorted.length - 1] ?? 0), long_tasks: window.long_tasks.length };
+		});
+		by_order[order] = { order: await evaluate(() => window.paint_hard_auto_copy.order()), rate: Math.round((q1.n - q0.n) / took), ...gaps };
+		await keyboard.press("m", ["Shift"]);
+	}
+	check("...and so do worst first and exact first", Object.entries(by_order).every(([order, r]) => r.order === order && r.rate > 950 && r.rate <= 1040 && r.frames > 150 && r.max < 250), JSON.stringify(by_order));
 
 	// 17. A seed from before the speed items: Phase 2's slot data, Pick Color under its old name, no speed copies.
-	const { auto_copy_speed_items: _speed_items, ...PHASE_2_SLOT } = SLOT_DATA;
+	const { auto_copy_speed_items: _speed_items, miss_margin_step: _margin_step, ...PHASE_2_SLOT } = SLOT_DATA;
 	await receive([...FULL_COLOR, "Pick Color"], PHASE_2_SLOT);
 	await sleep(2200); // the panel refreshes every 2 s while stopped
 	const old_seed = await evaluate(async () => {
@@ -532,7 +573,7 @@ try {
 	// 19. The Overclock bank (D25): it fills by itself up to its size, fillers go on top, and its own seconds go first.
 	const BANK_SLOT = { ...SLOT_DATA, overclock_bank_size_step: 3, overclock_fill_speed_step: 30 }; // 3 s a copy; half a second a second
 	const bank_now = () => evaluate(() => window.paint_hard_auto_copy.overclock_bank());
-	const BANK_ITEMS = [...FULL_COLOR, ...speed_items(10), "Progressive Overclock Bank Size", "Progressive Overclock Fill Speed"];
+	const BANK_ITEMS = [...FULL_COLOR, ...speed_items(10), "Progressive Overclock Bank Size", "Progressive Overclock Fill Speed", ...SURE];
 	// Sets the bank's level as another tab would leave it: a fill note that many seconds over every page's bank seconds.
 	const set_bank = (seconds) => evaluate((seconds) => {
 		const { mine, others } = window.paint_hard_auto_copy.overclock_record();
@@ -646,7 +687,7 @@ try {
 		const { fake_session } = await import("/src/archipelago.js");
 		fake_session(slot_data, ["Magnifier", "Brush", ...items], "another-game");
 		window.paint_hard_auto_copy.overclock_bank(); // loads that game's record
-	}, BANK_SLOT, [...FULL_COLOR, ...speed_items(10)]);
+	}, BANK_SLOT, [...FULL_COLOR, ...speed_items(10), ...SURE]);
 	await sleep(1200);
 	await receive(REFUSAL_ITEMS, BANK_SLOT);
 	await sleep(1200);
@@ -656,7 +697,7 @@ try {
 	// The time left doesn't jump when auto copy pauses: banked seconds count as the stretch they double. While paused the
 	// bank fills, and the estimate falls by what that adds. D25's defaults: 5 copies of each.
 	const DEFAULT_BANK = { ...SLOT_DATA, overclock_bank_size_step: 120, overclock_fill_speed_step: 2 };
-	const DEFAULT_ITEMS = [...FULL_COLOR, ...speed_items(10), ...Array(5).fill("Progressive Overclock Bank Size"), ...Array(5).fill("Progressive Overclock Fill Speed")];
+	const DEFAULT_ITEMS = [...FULL_COLOR, ...speed_items(10), ...Array(5).fill("Progressive Overclock Bank Size"), ...Array(5).fill("Progressive Overclock Fill Speed"), ...SURE];
 	await receive(DEFAULT_ITEMS, DEFAULT_BANK);
 	await set_bank(3);
 	await call("clear");

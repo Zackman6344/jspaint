@@ -7,13 +7,15 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { miss_margin, miss_percent } from "../../src/misses.js";
 import { check, evaluate, finish, mouse, open_paint, overclock_id, page, page_errors, sleep } from "./harness.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const WORLD = path.join(ROOT, "..", "paint-hard-apworld", "worlds", "paint_hard");
 const ITEMS_PY = process.env.PAIN_T_ITEMS_PY || path.join(WORLD, "items.py");
-// What the world writes for the client beyond items.py: each tool ladder's copies and the slot data at the default
-// options (its test_client_contract.py keeps the file true).
+// What the world writes for the client beyond items.py: each tool ladder's copies, the accuracy copies, the margin copies
+// at the default miss_margin_step, and the slot data at the default options (its test_client_contract.py keeps the
+// file true).
 const CONTRACT_JSON = process.env.PAIN_T_CONTRACT || path.join(WORLD, "test", "client_contract.json");
 const CONTRACT = JSON.parse(fs.readFileSync(CONTRACT_JSON, "utf8"));
 
@@ -27,6 +29,9 @@ for (let k = 0; k < 254; k++) names.push("Progressive Color Depth (Red)", "Progr
 names.push(...Array(8).fill("Progressive Canvas Width"), ...Array(6).fill("Progressive Canvas Height"));
 names.push(...Array(10).fill("Progressive Auto Copy Speed"), "Overclock", "Overclock", "Progressive Similarity Mode", "Progressive Difference Mode", "Progressive Pick Color");
 names.push("Progressive Brush Size"); // D24's names come through too
+// Phase 4's (D7): every accuracy copy the world makes, so auto copy never misses and the checks below go out as before,
+// one margin copy, and Auto Copy Loop, so it runs pass after pass.
+names.push(...Array(CONTRACT.accuracy_items).fill("Progressive Auto Copy Accuracy"), "Progressive Miss Margin", "Auto Copy Loop");
 // Late in a default solo seed the client holds about 8,000 items. Canvas items past the goal's size change nothing.
 names.push(...Array(7200).fill("Progressive Canvas Width"));
 const LATE_ITEM = { item: id_of("Progressive Canvas Width"), location: 2199000 + 9000 + names.length, player: 1, flags: 0 };
@@ -38,8 +43,9 @@ for (let k = 1; k <= 18; k++) LOCATIONS.push(2198900 + k);
 for (let n = 1; n <= 25; n++) LOCATIONS.push(2198950 + n);
 for (let i = 1; i <= 8000; i++) LOCATIONS.push(2199000 + i);
 // The world's own slot data at its defaults, with only what this test needs changed. Each changed key has to be one the
-// world writes, so a rename on that side can't hide behind a value typed here.
-const OVERRIDES = { overclock_seconds: 2, version: "1.0.0" };
+// world writes, so a rename on that side can't hide behind a value typed here. miss_margin_step is 5 rather than the
+// default 1, so a client that read the key and went on at a step of 1 would show.
+const OVERRIDES = { overclock_seconds: 2, miss_margin_step: 5, version: "1.0.0" };
 const SLOT_DATA = { ...CONTRACT.slot_data, ...OVERRIDES };
 const CONFIG = { seed: "SEED42", items: START_ITEMS, late_item: LATE_ITEM, locations: LOCATIONS, slot_data: SLOT_DATA, package: { checksum: "items-py", item_name_to_id: ITEMS, location_name_to_id: {} } };
 
@@ -110,6 +116,7 @@ const NOT_A_READ = /^(?:import \{[^}]*\} from "\.\/archipelago\.js";|export \{[^
 for (const file of fs.readdirSync(path.join(ROOT, "src")).filter((name) => name.endsWith(".js"))) {
 	const source = fs.readFileSync(path.join(ROOT, "src", file), "utf8");
 	for (const m of source.matchAll(/"(Progressive [A-Z][A-Za-z ()]+?)"/g)) SPELLED.add(m[1]);
+	for (const m of source.matchAll(/\bcount_of\("([^"]+)"\)/g)) SPELLED.add(m[1]); // Auto Copy Loop and Overclock too
 	for (const m of source.matchAll(/\bslotData\b/g)) {
 		const read = source.slice(m.index).match(NAMED_READ);
 		if (read) READ_KEYS.add(read[1] ?? read[3]);
@@ -123,7 +130,11 @@ const OLDER_SEEDS_ONLY = ["canvas_size_increment"];
 
 try {
 	const unknown = [...SPELLED].filter((name) => !(name in ITEMS));
-	check("every Progressive item the client names is in items.py", SPELLED.size >= 15 && unknown.length === 0, unknown.length ? `not in items.py: ${unknown.join(", ")}` : `${SPELLED.size} names`);
+	check("every item the client names is in items.py", SPELLED.size >= 15 && unknown.length === 0, unknown.length ? `not in items.py: ${unknown.join(", ")}` : `${SPELLED.size} names`);
+	// The client's miss model against the copies the world makes: its last accuracy copy ends misses, and one fewer leaves
+	// 10%; its last margin copy at its default step brings the margin to 0, and one fewer doesn't.
+	const accuracy = CONTRACT.accuracy_items, margin_items = CONTRACT.miss_margin_items, step = CONTRACT.slot_data.miss_margin_step;
+	check("the world's last accuracy copy ends misses and its last margin copy brings the margin to 0, each in the client's model", miss_percent(accuracy) === 0 && miss_percent(accuracy - 1) === 10 && miss_margin(margin_items, step) === 0 && miss_margin(margin_items - 1, step) > 0, JSON.stringify({ accuracy, margin_items, step, chance_one_short: miss_percent(accuracy - 1), margin_at_last: miss_margin(margin_items, step), margin_one_short: miss_margin(margin_items - 1, step) }));
 	const not_written = Object.keys(OVERRIDES).filter((key) => !CONTRACT.slot_data_keys.includes(key));
 	check("the slot data is the world's own, and every key this test changes is one it writes", not_written.length === 0 && Object.keys(CONTRACT.tool_ladders).length === 9, not_written.length ? `not written: ${not_written.join(", ")}` : `${CONTRACT.slot_data_keys.length} keys from ${CONTRACT_JSON}`);
 	const unread = [...READ_KEYS].filter((key) => !CONTRACT.slot_data_keys.includes(key) && !OLDER_SEEDS_ONLY.includes(key));
@@ -133,6 +144,9 @@ try {
 	await open_paint(ready, { hide_connection_window: false });
 	check("items.py has the names this test sends", names.every((name) => name in ITEMS), `${Object.keys(ITEMS).length} items read from ${ITEMS_PY}`);
 	check("before connecting, the session is offline", (await session()) === "offline", await session());
+	// With no slot data yet the page counts as a new seed with no items, not as one from before Phase 4.
+	const unconnected = await evaluate(() => ({ miss: paint_hard_auto_copy.miss_chance(), margin: paint_hard_auto_copy.miss_margin(), loop: paint_hard_auto_copy.loop() }));
+	check("...and auto copy would miss 90% at margin 255, with no Loop", unconnected.miss === 90 && unconnected.margin === 255 && !unconnected.loop, JSON.stringify(unconnected));
 	await connect();
 	const size = await evaluate(() => `${main_canvas.width}x${main_canvas.height}`);
 	check("the page logs in through its own Connect button", !(await window_shown()) && size === "800x600", size);
@@ -140,9 +154,11 @@ try {
 	const named = await evaluate(async () => {
 		const ap = await import("/src/archipelago.js");
 		const brush = [...document.querySelectorAll(".tool-options .chooser-option")].length;
-		return { top: paint_hard_auto_copy.top_tier(), banked: paint_hard_auto_copy.overclock_banked(), sim: ap.mode_unlocked("Similarity"), diff: ap.mode_unlocked("Difference"), pick: !document.getElementById("TOOL_PICK_COLOR").classList.contains("disabled"), brush_rung: ap.rungs("Progressive Brush Size"), brush_box: brush };
+		return { top: paint_hard_auto_copy.top_tier(), banked: paint_hard_auto_copy.overclock_banked(), sim: ap.mode_unlocked("Similarity"), diff: ap.mode_unlocked("Difference"), pick: !document.getElementById("TOOL_PICK_COLOR").classList.contains("disabled"), brush_rung: ap.rungs("Progressive Brush Size"), brush_box: brush, miss: paint_hard_auto_copy.miss_chance(), margin: paint_hard_auto_copy.miss_margin(), loop: paint_hard_auto_copy.loop() };
 	});
 	check("items.py's names reach the client: 10 speed tiers, 2 Overclocks (4 s), both views, Pick Color, a Brush Size", named.top === 10 && named.banked === 4 && named.sim && named.diff && named.pick && named.brush_rung === 1, JSON.stringify(named));
+	// The world's miss_margin_step reaches the client too: one Progressive Miss Margin at step 5 takes 5 off 255.
+	check("...and Phase 4's: the world's accuracy copies leave no misses, one margin copy at step 5 a margin of 250, and Auto Copy Loop is on", named.miss === 0 && named.margin === 250 && SLOT_DATA.miss_margin_step === 5 && named.loop, JSON.stringify({ miss: named.miss, margin: named.margin, loop: named.loop, miss_margin_step: SLOT_DATA.miss_margin_step }));
 	for (let i = 0; i < 50 && !(await evaluate(() => goal_ctx.getImageData(400, 300, 1, 1).data[3] === 255)); i++) await sleep(100);
 
 	// Auto copy at the top speed, connected: what goes out, and how often.

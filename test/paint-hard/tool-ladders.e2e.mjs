@@ -16,7 +16,7 @@ const SPEECH_STUB = `(() => {
 })();`;
 
 const TOOLS = ["Magnifier", "Brush", "Pencil", "Eraser/Color Eraser", "Airbrush", "Line", "Curve", "Rectangle", "Polygon", "Ellipse", "Rounded Rectangle"];
-const SLOT_DATA = { final_width: 800, final_height: 600, start_width: 400, start_height: 300, canvas_width_increment: 100, canvas_height_increment: 100, logic_percent: 80, goal_percent: 80, matched_pixels: 0, shade_counts: Array.from({ length: 255 }, (_, k) => k + 2), auto_copy_speed_items: 10, overclock_seconds: 2, version: "1.0.0", trap_blacklist: [], ladders: true, tool_ladders: true };
+const SLOT_DATA = { final_width: 800, final_height: 600, start_width: 400, start_height: 300, canvas_width_increment: 100, canvas_height_increment: 100, logic_percent: 80, goal_percent: 80, matched_pixels: 0, shade_counts: Array.from({ length: 255 }, (_, k) => k + 2), auto_copy_speed_items: 10, overclock_seconds: 2, miss_margin_step: 1, version: "1.0.0", trap_blacklist: [], ladders: true, tool_ladders: true };
 const { tool_ladders: _, ...OLD_SEED } = SLOT_DATA; // a seed from before D24
 const WHITE = [255, 255, 255, 255];
 const json = (value) => JSON.stringify(value);
@@ -99,6 +99,9 @@ try {
 	await evaluate(() => { for (const w of document.querySelectorAll(".window")) if (/Archipelago Connection Options/.test(w.textContent)) w.style.display = "none"; });
 
 	await receive([]);
+	// With no margin copies the margin is 255 in a Phase 4 seed and 0 in one from before, so this says the stand-in's slot
+	// data still names miss_margin_step.
+	check("the stand-in plays as a Phase 4 seed: its margin is 255", (await evaluate(() => window.paint_hard_auto_copy.miss_margin())) === 255, String(await evaluate(() => window.paint_hard_auto_copy.miss_margin())));
 	await call("set_magnification", 1);
 	await mouse.click(5, 895); // the status bar, to give the page focus for the keys
 	await sleep(100);
