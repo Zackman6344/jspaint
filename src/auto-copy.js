@@ -10,11 +10,12 @@
 // Progressive Auto Copy Accuracy and Progressive Miss Margin items close the gap. One run of auto copy is one pass over
 // the canvas; Auto Copy Loop starts each next one by itself.
 
-import { calculate_logic_similarity, calculate_similarity, deselect, undoable, update_helper_layer } from "./functions.js";
+import { calculate_similarity, deselect, goal_pixels, scoring_formula, show_similarity, shown_view, undoable, update_helper_layer } from "./functions.js";
 import { $G, get_icon_for_tool, get_rgba_from_color } from "./helpers.js";
 import { legalizeColor } from "./$ColorBox.js";
 import { final_height, final_width, game_changed, rungs, send, session_name, slotData } from "./archipelago.js";
 import { draws, land_chance, margin_ranges, miss_margin, miss_percent, miss_value, rolls_miss, seeded } from "./misses.js";
+import { pixel_score } from "./scoring.js";
 import { quantize } from "./shades.js";
 
 const KEY = "m";
@@ -37,7 +38,8 @@ const pick_color_icon = () => get_icon_for_tool(get_tool_by_id("TOOL_PICK_COLOR"
 const in_bounds = (element, { x, y }) => x >= 0 && y >= 0 && x < element.width && y < element.height;
 // Browsers that blur canvas reads against fingerprinting (Brave, Firefox's strict mode) can read a color back a step
 // off. The page checks for that as it loads, and again whenever a pixel auto copy or M just wrote reads back different
-// (D7). Only then may each channel be 1 off when a pixel is judged. Reads further off than that can't judge pixels.
+// (D7). Only then may each channel be 1 off when a pixel is judged. Reads further off than that can't judge pixels, and
+// count as blocked until a later probe reads clean (reads_are_blocked()).
 let read_noise = null; // where noise was found: "load" or "read-back", or null for none
 let reads_blocked = false;
 const BLOCKED = "Your browser blocks reading the canvas, which auto copy and M need. Allow canvas reads for this site.";
@@ -266,9 +268,11 @@ const can_fill = () => fill_per_second() > 0 && bank_size() > 0 && !disconnected
 const kept = new Map(), refused = new Set();
 const whole_totals = (totals) => Number.isFinite(totals?.spent) && Number.isFinite(totals?.used);
 const whole_note = (note) => Number.isFinite(note?.filled) && Number.isFinite(note?.at);
-function read(key, storage = localStorage) {
+// What localStorage holds under a key, or sessionStorage with `where` "session". The storage is named inside the try:
+// with site data blocked, naming it throws.
+function read(key, where = "local") {
 	try {
-		const value = storage.getItem(key);
+		const value = (where === "session" ? sessionStorage : localStorage).getItem(key);
 		if (value !== null) return JSON.parse(value);
 	} catch { }
 	return null;
@@ -338,7 +342,7 @@ function others_totals() {
 // before the clock was set back, goes last.
 function fill_note(now) {
 	const key = overclock_key("fill"), stored = read(key);
-	const own = refused.has(key) || !whole_note(stored) ? kept.get(key) ?? read(key, sessionStorage) : null;
+	const own = refused.has(key) || !whole_note(stored) ? kept.get(key) ?? read(key, "session") : null;
 	const notes = [stored, own].filter(whole_note);
 	const rank = (note) => [note.at <= now ? 1 : 0, note.at];
 	notes.sort((x, y) => rank(y)[0] - rank(x)[0] || rank(y)[1] - rank(x)[1]);
@@ -356,7 +360,7 @@ function overclock_session() {
 	overclock.session = session;
 	// This page's own totals for the game, from this load or an earlier load of this tab, or from the closed page whose id
 	// it took. Only this page writes them, and they only grow, so the largest is the latest.
-	const totals = [kept.get(page_key()), read(page_key()), read(page_key(), sessionStorage)].filter(whole_totals);
+	const totals = [kept.get(page_key()), read(page_key()), read(page_key(), "session")].filter(whole_totals);
 	overclock.mine = { spent: Math.max(0, ...totals.map((t) => t.spent)), used: Math.max(0, ...totals.map((t) => t.used)) };
 	overclock.fill_from = Date.now(); // the bank fills while a tab is open, not while none is
 	overclock_merge(false);
@@ -474,11 +478,6 @@ function own_history(callback) {
 	try { return callback(); } finally { own_history_change = false; }
 }
 
-// A pixel's score on the client's 0.5.0+ scale, exactly as calculate_similarity() works it out.
-function pixel_score(dr, dg, db) {
-	return 2 * (1 - Math.sqrt((dr ** 2 + dg ** 2 + db ** 2) / 3) / 255) - 1;
-}
-
 function resync(now) {
 	const similarity = calculate_similarity();
 	scores.sum = similarity * final_width * final_height / 100;
@@ -496,11 +495,7 @@ function running_similarity() {
 // Similarity and Difference Mode draw from the full score, so while either view shows, auto copy scores the whole
 // canvas now and then, keeping that to about 2% of the time as M does.
 let view_every = 1000;
-const views_shown = () => $sim.is(":visible") || $diff.is(":visible");
-
-function show_similarity(similarity) {
-	$status_similarity.text(similarity.toFixed(4) + "%/" + calculate_logic_similarity().toFixed(4) + "%");
-}
+const views_shown = () => shown_view !== null;
 
 // --- Where the pointer is ---
 
@@ -509,8 +504,8 @@ function position_on(element, clientX, clientY) {
 	const rect = element.getBoundingClientRect();
 	if (!rect.width || !rect.height) return null;
 	return {
-		x: Math.floor((clientX - rect.left) / rect.width * element.width),
-		y: Math.floor((clientY - rect.top) / rect.height * element.height),
+		x: Math.floor((clientX - rect.left) * element.width / rect.width),
+		y: Math.floor((clientY - rect.top) * element.height / rect.height),
 	};
 }
 
@@ -549,7 +544,7 @@ function each_pixel_on_line(a, b, callback) {
 // allowance has a pixel left, and keeps the running total up to date. M misses as auto copy does (D6). Returns "same"
 // when the pixel is already as good as your best shade, "wait" when the allowance is empty, "painted" or "missed".
 function copy_pixel({ x, y }, bucket, tables) {
-	const goal = goal_read(), at = (y * goal.width + x) * 4;
+	const goal = goal_pixels(), at = (y * goal.width + x) * 4;
 	const gr = goal.data[at], gg = goal.data[at + 1], gb = goal.data[at + 2];
 	const pixel = main_ctx.getImageData(x, y, 1, 1);
 	if (settled(pixel.data, 0, gr, gg, gb, tables)) return "same";
@@ -557,7 +552,8 @@ function copy_pixel({ x, y }, bucket, tables) {
 	bucket.tokens -= 1;
 	const [r, g, b] = attempt(gr, gg, gb, tables, m_random, miss_stats.m);
 	const [cr, cg, cb] = pixel.data;
-	scores.sum += pixel_score(r - gr, g - gg, b - gb) - pixel_score(cr - gr, cg - gg, cb - gb);
+	const formula = scoring_formula();
+	scores.sum += pixel_score(formula, r - gr, g - gg, b - gb) - pixel_score(formula, cr - gr, cg - gg, cb - gb);
 	pixel.data.set([r, g, b, 255]);
 	main_ctx.putImageData(pixel, x, y);
 	last_write = { x, y, r, g, b };
@@ -583,9 +579,9 @@ function disconnected() {
 }
 
 // --- Undo steps, autosave and checks ---
-// Paint keeps a full copy of the canvas in every undo step, autosaves 100 ms after the last change it hears about,
-// and scores checks by comparing the whole goal with the canvas. That's too heavy to do for every pixel, so painting
-// marks them as due and catch_up() does them on a timer, and right away when copying stops.
+// Paint keeps a full copy of the canvas in every undo step, saves the canvas as a PNG at the pace sessions.js sets, 5 s
+// apart or more (task 7.4), and scores checks over the whole area the canvas and the goal share. That's too heavy to do
+// for every pixel, so painting marks them as due and catch_up() does them on a timer, and right away when copying stops.
 
 // Makes a new undo step for what's on the canvas now. Paint autosaves and sends checks for a new step itself.
 function new_step(state, name) {
@@ -617,12 +613,18 @@ function commit(state, name) {
 }
 
 // Paint's own update of a step (make_or_update_undoable), minus rebuilding the History window, which every 50 ms
-// would make it impossible to scroll or click. It only needs rebuilding when the name changes.
+// would make it impossible to scroll or click. It only needs rebuilding when the name changes. It reads the whole
+// canvas, so the next waits 50 times what this one took, or the state's own interval if that's longer, keeping these
+// reads to about 2% of the time as view_every and M's scoring do (task 7.3). Pausing, letting go of M and a press on
+// the canvas still save one at once.
 function save_snapshot(state) {
 	if (!state.stale || current_history_node !== state.node) return;
+	const started = performance.now();
 	state.node.image_data = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
 	state.stale = false;
 	state.snapshot_at = performance.now();
+	state.snapshot_every = Math.max(state.min_snapshot_every, (state.snapshot_at - started) * 50);
+	note_read(read_log.snapshots, state === auto ? "auto copy" : "M");
 	if (state.node.name !== state.name) {
 		state.node.name = state.name;
 		own_history(() => $G.triggerHandler("history-update"));
@@ -637,7 +639,7 @@ function catch_up(state, force) {
 	if (state.unsaved && (force || now - state.saved_at >= 5000)) {
 		state.unsaved = false;
 		state.saved_at = now;
-		$G.triggerHandler("session-update"); // Paint autosaves 100 ms after the last of these, so they can't come every tick
+		$G.triggerHandler("session-update"); // asks for an autosave, which sessions.js paces (task 7.4)
 	}
 	if (state.unscored && (force || now - state.scored_at >= state.score_every)) send_checks(state, force);
 	if (force && state === auto) overclock_save();
@@ -666,7 +668,14 @@ function send_checks(state, full) {
 	state.score_every = state === auto ? SEND_EVERY_MS : Math.max(state.min_score_every, (state.scored_at - started) * 50);
 }
 
-const new_progress = (snapshot_every, min_score_every) => ({ node: null, name: "", stale: false, unsaved: false, unscored: false, snapshot_at: 0, saved_at: 0, scored_at: 0, snapshot_every, score_every: min_score_every, min_score_every });
+const new_progress = (snapshot_every, min_score_every) => ({ node: null, name: "", stale: false, unsaved: false, unscored: false, snapshot_at: 0, saved_at: 0, scored_at: 0, snapshot_every, min_snapshot_every: snapshot_every, score_every: min_score_every, min_score_every });
+
+// For tests: when the last counts of the pixels left and the last snapshots of a step ran, by performance.now().
+const read_log = { counts: [], snapshots: [] };
+function note_read(list, by = null) {
+	list.push(by ? { at: performance.now(), by } : performance.now());
+	if (list.length > 40) list.shift();
+}
 
 // --- Hold M ---
 // M paints from the same allowance as auto copy (D6): at most one second of it waits in line, and pixels passed over
@@ -684,9 +693,8 @@ function queue(pixel) {
 
 function start_sweep(code) {
 	if (busy()) return show_status("Let go of the mouse first.");
-	if (reads_blocked) return show_status(BLOCKED);
+	if (reads_are_blocked()) return show_status(BLOCKED); // probes again, for a player who has allowed reads since
 	if (sweep) end_sweep(true);
-	goal.data = null; // read the goal again at the first pixel, in case it changed
 	// filled_at starts where the allowance last filled, so time nothing was copying still counts, up to a second.
 	sweep = { ...new_progress(250, 500), code, last: null, pending: [], count: 0, missed: 0, first: null, seen: false, outside: false, skipped: 0, frame: 0, timer: 0, released: false, filled_at: (alongside() ? m_allowance : allowance).at };
 	const pixel = pixel_under_cursor();
@@ -874,17 +882,9 @@ function attempt(gr, gg, gb, tables, random, stats) {
 	return [miss_value(red, r, random), miss_value(green, g, random), miss_value(blue, b, random)];
 }
 
-// The goal, read whole and kept, so every pixel is judged against the same read: in a browser whose reads are noisy, a
-// read of another size or place can come back different. It's read again as auto copy starts and at each pass, at each
-// count of the pixels left, as M starts, and when a new goal loads.
-const goal = { data: null, width: 0, height: 0 };
-function read_goal() {
-	goal.width = goal_canvas.width;
-	goal.height = goal_canvas.height;
-	goal.data = goal_ctx.getImageData(0, 0, goal.width, goal.height).data;
-	return goal;
-}
-const goal_read = () => (goal.data && goal.width === goal_canvas.width && goal.height === goal_canvas.height ? goal : read_goal());
+// The goal is the page's one read of it (goal_pixels(), task 7.3), whole, so every pixel is judged against the same
+// read: in a browser whose reads are noisy, a read of another size or place can come back different. A new goal is read
+// again at its save-goal; a count of the pixels left, M and a new pass don't read it.
 
 // The last pixel auto copy or M wrote, read back in the same task: nothing else can have changed it, so a difference is
 // read noise. A step off turns on the 1-level tolerance until the page reloads; further off, reads can't judge pixels.
@@ -899,9 +899,9 @@ function check_read_back() {
 	last_write = null;
 }
 
-// As the page loads: three patterns written to a small canvas and read back. Exact means reads are clean, a step off
-// means noise, and further off means reads are blocked.
-function probe_reads() {
+// Three patterns written to a small canvas and read back. How far off the reads come: 0 means reads are clean, 1 means
+// noise, and more means reads are blocked.
+function probe_off() {
 	const probe = document.createElement("canvas");
 	probe.width = probe.height = 16;
 	const context = probe.getContext("2d", { willReadFrequently: true });
@@ -917,6 +917,14 @@ function probe_reads() {
 	} catch {
 		off = 256;
 	}
+	return off;
+}
+// The probe as the page loads, once a page.
+let probed = false;
+function probe_reads() {
+	if (probed) return;
+	probed = true;
+	const off = probe_off();
 	if (off > 1) reads_blocked = true;
 	else if (off === 1) read_noise = "load";
 }
@@ -924,10 +932,12 @@ function probe_reads() {
 // How many pixels of the unlocked canvas aren't yet as good as your best shade, at your color depth. The canvas is read
 // in the strips the scan reads: in a browser whose reads are noisy, a read of another size or place can come back
 // different, and a pixel the count calls off that the scan calls done would keep a Loop run going with nothing to paint.
-// Beside the count, how many tries those pixels should take at your miss chance, for the time left.
-let tries_per_pixel = 1;
+// Beside the count, how many tries those pixels should take at your miss chance, for the time left. A count's cost sets
+// how long the next waits (count_every()).
+let tries_per_pixel = 1, count_cost = 0;
 function count_left() {
-	const tables = rounding_tables(), goal = read_goal(), chance = miss_chance();
+	const started = performance.now();
+	const tables = rounding_tables(), goal = goal_pixels(), chance = miss_chance();
 	const width = Math.min(main_canvas.width, goal.width), height = Math.min(main_canvas.height, goal.height);
 	const [red, green, blue] = tables.ranges;
 	let left = 0, tries = 0;
@@ -943,8 +953,16 @@ function count_left() {
 		}
 	}
 	tries_per_pixel = left ? tries / left : 1;
+	count_cost = performance.now() - started;
+	note_read(read_log.counts);
 	return left;
 }
+
+// While auto copy runs, and from the panel while it's stopped, the pixels left are counted every 2 s, or 50 times what
+// the last count took if that's longer, keeping counts to about 2% of the time (task 7.3): 27 ms at 800x600 and 0.41 s at
+// 4000x3000 in Chrome 158. A pass's end counts, and so do new rounding tables, at once.
+const COUNT_EVERY_MS = 2000;
+const count_every = () => Math.max(COUNT_EVERY_MS, count_cost * 50);
 
 // A pass's sweeps, each over the whole canvas from the top, painting the pixels its test picks (D23). Top to bottom is
 // one sweep. Exact first sweeps first for the pixels whose goal color is one of your shades in all three channels.
@@ -997,7 +1015,7 @@ function auto_tick() {
 			if (late || (elapsed >= banked && from_fillers > 0)) overclock_save();
 		}
 		fill_allowance(allowance, speed() * (elapsed > 0 ? 1 + boosted / elapsed : 1), elapsed, elapsed);
-		const tables = rounding_tables(), goal = goal_read();
+		const tables = rounding_tables(), goal = goal_pixels(), formula = scoring_formula();
 		const width = Math.min(main_canvas.width, goal.width), height = Math.min(main_canvas.height, goal.height);
 		// An order you picked, or one that arrived, starts the pass again in that order. In exact first so do new shades,
 		// which change the pixels it can make exactly right; shade sets aren't nested.
@@ -1042,7 +1060,7 @@ function auto_tick() {
 					const gr = goal.data[at], gg = goal.data[at + 1], gb = goal.data[at + 2];
 					if (settled(canvas, i, gr, gg, gb, tables) || !picks(canvas, i, gr, gg, gb, tables)) continue;
 					const [r, g, b] = attempt(gr, gg, gb, tables, auto_random, miss_stats.auto);
-					scores.sum += pixel_score(r - gr, g - gg, b - gb) - pixel_score(canvas[i] - gr, canvas[i + 1] - gg, canvas[i + 2] - gb);
+					scores.sum += pixel_score(formula, r - gr, g - gg, b - gb) - pixel_score(formula, canvas[i] - gr, canvas[i + 1] - gg, canvas[i + 2] - gb);
 					one_pixel.data.set([r, g, b, 255]);
 					main_ctx.putImageData(one_pixel, auto.x, auto.y);
 					last_write = { x: auto.x, y: auto.y, r, g, b };
@@ -1073,7 +1091,7 @@ function auto_tick() {
 		}
 		if (finished) return finish_auto();
 		if (pass_over) return end_pass();
-		if (now - auto.counted_at > 2000 || auto.counted_at < tables_changed_at) {
+		if (now - auto.counted_at >= count_every() || auto.counted_at < tables_changed_at) {
 			auto.left = count_left();
 			auto.counted_at = now;
 		}
@@ -1089,7 +1107,7 @@ function auto_tick() {
 // past the trap that reopened pixels.
 function start_auto(by_loop = false) {
 	if (auto?.running) return;
-	if (reads_blocked) return update_panel(BLOCKED);
+	if (reads_are_blocked()) return update_panel(BLOCKED);
 	let left;
 	try {
 		left = count_left();
@@ -1208,12 +1226,16 @@ function open_panel() {
 	// While stopped, keep the count honest: a trap, a canvas size item or a new goal changes it after "Done". With Loop
 	// on, a run that finished starts again when the game reopens pixels: the count rose since the last one, and a color
 	// or canvas item, a trap or a DeathLink reset came in between. Your own changes don't, so a canvas you clear or paint
-	// by hand stays as you left it until then, and a run you paused stays paused.
+	// by hand stays as you left it until then, and a run you paused stays paused. A count that costs more than this
+	// timer's 2 s allows waits its turn, as auto copy's own do (count_every()), unless new rounding tables came in.
 	const recount = setInterval(() => {
 		const finished_with_loop = !!auto?.done && has_loop() && loop_switch();
 		if (!auto || auto.running || (document.hidden && !finished_with_loop)) return update_panel();
 		try {
+			rounding_tables();
+			if (count_every() > COUNT_EVERY_MS && performance.now() - auto.counted_at < count_every() && auto.counted_at >= tables_changed_at) return update_panel();
 			const left = count_left();
+			auto.counted_at = performance.now();
 			if (left !== auto.left) auto.left = left;
 		} catch { } // rounding_tables() can throw; Start shows why
 		if (auto.done) {
@@ -1385,10 +1407,7 @@ function init() {
 		history_changes++;
 		scores.valid = false;
 	});
-	$G.on("save-goal", () => {
-		scores.valid = false;
-		goal.data = null; // read the new goal before it's judged against
-	});
+	$G.on("save-goal", () => { scores.valid = false; }); // archipelago.js's handler has dropped the goal as read
 	probe_reads();
 	window.jspaintCopyGoal = {
 		get enabled() { return enabled; },
@@ -1427,6 +1446,8 @@ function init() {
 		choose_order,
 		pass: () => ({ number: auto?.pass ?? 0, running: !!auto?.running, ended: !!auto?.pass_ended, done: !!auto?.done, sweep: auto?.sweep ?? 0 }),
 		pixels_left: count_left,
+		// When the last counts of the pixels left and snapshots of a step ran, and how long the next of each waits (task 7.3).
+		read_log: () => ({ counts: [...read_log.counts], snapshots: read_log.snapshots.map((entry) => ({ ...entry })), count_every: count_every(), snapshot_every: { auto: auto?.snapshot_every ?? null, m: sweep?.snapshot_every ?? null } }),
 		read_noise: () => (reads_blocked ? "blocked" : read_noise),
 	};
 }
@@ -1436,4 +1457,28 @@ settle_page();
 if (document.readyState === "complete") init();
 else addEventListener("load", init);
 
-export { show_auto_copy_panel };
+// Whether this browser blocks canvas reads, as the load's probe or a read back found. Autosave asks before each save
+// (task 7.4): a blocked browser's PNG comes out blank, and would overwrite the session's record. Asked before the page has
+// loaded, it probes then. The player can allow canvas reads while the page is open, as Firefox's canvas permission does
+// without a reload, so while reads count as blocked each ask probes again, and a probe that reads clean or a step off
+// ends the block for saves, auto copy and M.
+function reads_are_blocked() {
+	probe_reads();
+	if (reads_blocked) {
+		const off = probe_off();
+		if (off <= 1) {
+			reads_blocked = false;
+			if (off === 1 && !read_noise) read_noise = "load";
+		}
+	}
+	return reads_blocked;
+}
+
+// Whether auto copy or M has painted pixels since it last asked Paint to save, which catch_up() does at most every 5 s.
+// A session counts them as a change when it saves as the page goes, as it ends, as the tab leaves it for another game,
+// and before an import holds its saves (sessions.js).
+function copies_unsaved() {
+	return !!(auto?.unsaved || sweep?.unsaved);
+}
+
+export { copies_unsaved, reads_are_blocked, show_auto_copy_panel };

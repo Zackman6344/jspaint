@@ -4,7 +4,7 @@
 // import { available_languages, get_iso_language_name, get_language, get_language_emoji, get_language_endonym, localize, set_language } from "./app-localization.js";
 import { mode_unlocked, received, show_text_client } from "./archipelago.js";
 import { show_auto_copy_panel } from "./auto-copy.js";
-import { are_you_sure, change_url_param, clear, delete_selection, deselect, edit_copy, edit_cut, file_new, file_open, file_print, file_save, file_save_as, image_attributes, image_flip_and_rotate, image_invert_colors, redo, render_history_as_gif, sanity_check_blob, save_selection_to_file, select_all, set_magnification, show_about_paint, show_custom_zoom_window, show_document_history, toggle_grid, toggle_thumbnail, undo, update_magnified_canvas_size, view_bitmap } from "./functions.js";
+import { are_you_sure, change_url_param, clear, delete_selection, deselect, edit_copy, edit_cut, file_new, file_open, file_print, file_save, file_save_as, image_attributes, image_flip_and_rotate, image_invert_colors, redo, render_history_as_gif, sanity_check_blob, save_selection_to_file, select_all, set_magnification, show_about_paint, show_custom_zoom_window, show_document_history, shown_view, toggle_grid, toggle_thumbnail, toggle_view, undo, update_magnified_canvas_size, view_bitmap } from "./functions.js";
 import { show_help } from "./help.js";
 import { is_discord_embed } from "./helpers.js";
 import { show_imgur_uploader } from "./imgur.js";
@@ -952,11 +952,10 @@ const menus = {
 			speech_recognition: [],
 			checkbox: {
 				toggle: () => {
-					$sim.toggle();
-					$diff.hide();
+					toggle_view("similarity");
 				},
 				check: () => {
-					return $sim.is(":visible");
+					return shown_view === "similarity";
 				},
 			},
 			enabled: () => {
@@ -970,11 +969,10 @@ const menus = {
 			speech_recognition: [],
 			checkbox: {
 				toggle: () => {
-					$diff.toggle();
-					$sim.hide();
+					toggle_view("difference");
 				},
 				check: () => {
-					return $diff.is(":visible");
+					return shown_view === "difference";
 				},
 			},
 			enabled: () => {

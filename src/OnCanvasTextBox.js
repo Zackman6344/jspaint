@@ -229,8 +229,8 @@ class OnCanvasTextBox extends OnCanvasObject {
 			const rect = this.$el[0].getBoundingClientRect();
 			const cx = e.clientX - rect.left;
 			const cy = e.clientY - rect.top;
-			mox = ~~(cx / rect.width * this.canvas.width);
-			moy = ~~(cy / rect.height * this.canvas.height);
+			mox = Math.floor(cx * this.canvas.width / rect.width);
+			moy = Math.floor(cy * this.canvas.height / rect.height);
 			this.dragging = true;
 			update_helper_layer(); // for thumbnail, which draws textbox outline if it's not being dragged
 			$G.on("pointermove", pointermove);

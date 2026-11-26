@@ -1,6 +1,8 @@
 import { Client } from "../lib/archipelago.min.js";
-import { calculate_similarity, clear, image_invert_colors, reset_canvas_and_history, resize_canvas_without_saving_dimensions, select_tool, set_magnification, undo } from "./functions.js";
+import { calculate_similarity, clear, drop_goal_pixels, goal_pixels, image_invert_colors, reset_canvas_and_history, resize_canvas_without_saving_dimensions, scored_at_size, select_tool, set_magnification, show_similarity, show_view, shown_view, undo } from "./functions.js";
 import { show_help } from "./help.js";
+import { $G } from "./helpers.js";
+import { request_of, transact } from "./idb.js";
 import { flip_horizontal, flip_vertical } from "./image-manipulation.js";
 import { tools } from "./tools.js";
 import { quantize } from "./shades.js";
@@ -12,8 +14,85 @@ var slotData = {};
 var final_width = 800;
 var final_height = 600;
 var recent_traps = {};
+// The game this page has loaded, { seed, team, slot }, as its last login that went through named it, or null before
+// one. A dropped connection keeps it, as the page keeps that game's slot data and items. A login the server refused
+// leaves it too, where the client by then holds the other room's seed. A test's fake_session() loads none.
+var loaded = null;
+function loaded_game() {
+	return loaded && { ...loaded };
+}
+// The game the goal canvas was last cleared for, as "seed-team-slot".
+var goal_game = null;
 
-client.package.importPackage(JSON.parse(localStorage.getItem("datapackage_cache") ?? "{}"));
+// Data packages are cached in Paint's IndexedDB (idb.js, decision 6), one record a game and checksum, where they take
+// none of localStorage's room. The bundled library (lib/archipelago.min.js) asks this cache for each of a room's games
+// before it asks the server, and the login waits for the answer, so a read that hasn't answered in 2 s counts as a miss.
+// The library asks for a room's games one after another, so once a read has had no answer in 2 s, the reads after it
+// don't wait, until one answers: a login loses 2 s to a database that doesn't answer, whatever the room's size.
+// A package cached in localStorage before task 7.4 is read from there until a login moves it over. Where IndexedDB
+// isn't available, localStorage stays the cache. It is read only once asked: with site data blocked, naming
+// localStorage throws, and as this module loaded that stopped every module that imports it.
+const PACKAGE_KEY = "datapackage_cache";
+const PACKAGE_WAIT_MS = 2000;
+let package_reads_stuck = false;
+let local_packages = null;
+function local_package(game, checksum) {
+	if (!local_packages) {
+		try {
+			local_packages = JSON.parse(localStorage.getItem(PACKAGE_KEY) ?? "{}").games ?? {};
+		} catch (_error) {
+			local_packages = {};
+		}
+	}
+	const data = local_packages[game];
+	return data?.checksum === checksum ? data : null;
+}
+client.package.setCache({
+	async getPackage(game, checksum) {
+		let answered = false;
+		const stored = transact(["packages"], "readonly", ({ packages }) => request_of(packages.get([game, checksum]))).catch(() => null).then((record) => {
+			answered = true;
+			package_reads_stuck = false;
+			return record;
+		});
+		if (package_reads_stuck) return local_package(game, checksum);
+		const record = await Promise.race([stored, new Promise((resolve) => setTimeout(() => {
+			// The limit marks the reads as stuck only when its own read is still waiting.
+			if (!answered) package_reads_stuck = true;
+			resolve(null);
+		}, PACKAGE_WAIT_MS))]);
+		return record?.package ?? local_package(game, checksum);
+	},
+});
+// Caches the packages this page holds after a login: each game's under its checksum, in place of that game's older
+// ones. What localStorage's cache holds for games this room doesn't have moves over with them, each only where the store
+// holds no package for its game, so a newer one isn't replaced. localStorage's copy goes once they're all in.
+function cache_packages() {
+	const games = client.package.exportPackage().games;
+	local_package("", ""); // reads localStorage's cache, if this page hasn't yet
+	const others = Object.entries(local_packages ?? {}).filter(([game, data]) => !(game in games) && typeof data?.checksum === "string");
+	transact(["packages"], "readwrite", async ({ packages }) => {
+		for (const [game, data] of Object.entries(games)) {
+			if (typeof data.checksum !== "string" || await request_of(packages.count([game, data.checksum]))) continue;
+			for (const key of await request_of(packages.index("game").getAllKeys(game))) packages.delete(key);
+			packages.put({ game, checksum: data.checksum, package: data, cached_at: Date.now() });
+		}
+		for (const [game, data] of others) {
+			if (await request_of(packages.index("game").count(game))) continue;
+			packages.put({ game, checksum: data.checksum, package: data, cached_at: Date.now() });
+		}
+	}).then(() => {
+		local_packages = {};
+		try { localStorage.removeItem(PACKAGE_KEY); } catch (_error) { /* site data blocked */ }
+	}, () => {
+		try {
+			localStorage.setItem(PACKAGE_KEY, JSON.stringify({ games: { ...local_packages, ...games } }));
+		} catch (ex) {
+			console.log("Unable to cache datapackage.");
+			console.log(ex);
+		}
+	});
+}
 
 // Set up an event listener for whenever a message arrives and print the plain-text content to the console.
 client.messages.on("message", (content) => {
@@ -21,24 +100,86 @@ client.messages.on("message", (content) => {
 });
 
 var $ap_options_window = $Window({ title: "Archipelago Connection Options", minimizeButton: false, maximizeButton: false, closeButton: false })
-	.addClass("maximized").addClass("focused").css({ left: 0, top: 0, width: "100vw", height: "100vh" });
+	.addClass("maximized").addClass("focused").addClass("ap-options-window").css({ left: 0, top: 0, width: "100vw", height: "100vh" });
 // os-gui closes any window on Escape. This one covers the page until a game connects, and comes back if it drops.
 $ap_options_window.on("close", (e) => e.preventDefault());
+// os-gui brings a window to the front at any press in it, and this one covers the page: a click in its form would put it
+// over a message that had opened above it, with no way to bring the message back. So it stays behind every window that
+// opens after it. A message that opens while the player types in its form leaves the focus there (msgbox.js).
+$ap_options_window.bringToFront = () => { };
 // Until then the page counts as a ladder seed with no copies (D24). The sizes are page globals that app-state.js sets
 // after this module runs, so this waits for the page.
 $(() => set_tool_ladders(() => 0, tools));
 $ap_options_window.$content.append('<p><label>Host: <input name="aphost" value="archipelago.gg"></label></p><p><label>Port: <input name="apport" placeholder="38281"></label></p><p><label>Slot name: <input name="apslot"></label></p><p><label>Password: <input name="appass"></label></p>');
-$("<button>Connect!</button>").on("click", function () {
-	client.login($("[name=aphost]").val() + ":" + $("[name=apport]").val(), $("[name=apslot]").val(), "Pain-T", { "password": $("[name=appass]").val() })
+// One login at a time: a click while a login is under way, or while one waits for the session restore, does nothing.
+// Each login that went through opened a socket of its own and bound the item, message and disconnect handlers again, so
+// three clicks during one wait made a trap undo three steps. The test is a flag, since a click that script triggers
+// runs the handler on a disabled button too. The line under the button says what the login waits for.
+var logging_in = false, login_turn = 0, login_sent = false;
+var $ap_status = $('<p class="ap-status" aria-live="polite"></p>');
+// Gives Connect back once the login of that turn has gone through or failed.
+function login_ended(turn) {
+	if (turn !== login_turn) return;
+	logging_in = false;
+	login_sent = false;
+	clearTimeout(quiet_timer);
+	$ap_connect.prop("disabled", false);
+	$ap_status.text("");
+}
+// A connection that drops while its login waits for the server, as while a room's data packages come, leaves that login
+// waiting for good: the library has no time limit there. Connect comes back at the drop, and the line says so. Only a
+// drop after the library took the login counts. As it takes one, the library closes a socket an earlier login left
+// open, as a login the server refused leaves one, and that close fires the same event.
+client.socket.on("disconnected", function () {
+	if (!login_sent) return;
+	login_ended(login_turn);
+	$ap_status.text("The connection dropped before the login went through. Connect to try again.");
+});
+// A server that opens the socket and then sends nothing leaves the login waiting for good too, with the connection up.
+// After 20 s with no packet from the server the line says so. Connect stays disabled: a second login while the library
+// holds this one sends two Connect commands.
+const LOGIN_QUIET_MS = 20000;
+var quiet_timer = 0;
+function watch_quiet(turn) {
+	clearTimeout(quiet_timer);
+	quiet_timer = setTimeout(() => {
+		if (turn === login_turn && logging_in) $ap_status.text("The server hasn't answered in 20 s. Reload this tab to try again.");
+	}, LOGIN_QUIET_MS);
+}
+client.socket.on("receivedPacket", function () {
+	if (!login_sent) return;
+	$ap_status.text("Connecting...");
+	watch_quiet(login_turn);
+});
+var $ap_connect = $("<button>Connect!</button>").on("click", function () {
+	if (logging_in) return;
+	logging_in = true;
+	const turn = ++login_turn;
+	$ap_connect.prop("disabled", true);
+	$ap_status.text(window.paint_hard_session?.ready === false ? "Restoring this tab's canvas from storage..." : "Connecting...");
+	// The click asks the browser to keep Paint's storage (sessions.js, task 7.4), and nothing waits on its answer.
+	$G.triggerHandler("connect-click");
+	// While a session restore draws the stored canvas, the login waits until it lands or fails (task 7.5): the canvas
+	// takes its stored size first, and the login's items grow it from there. The address the login goes to is kept.
+	let sent = null;
+	(window.paint_hard_session?.restored ?? Promise.resolve())
+		.then(() => {
+			$ap_status.text("Connecting...");
+			sent = { aphost: $("[name=aphost]").val(), apport: $("[name=apport]").val(), apslot: $("[name=apslot]").val() };
+			const login = client.login(sent.aphost + ":" + sent.apport, sent.apslot, "Pain-T", { "password": $("[name=appass]").val() });
+			login_sent = true;
+			watch_quiet(turn);
+			return login;
+		})
 		.then(function (e) {
+			// A login the player clicked past after its connection dropped still waits in the library, and the server's
+			// answer to the next login answers it too. The page takes the answer to the latest click alone, so the item,
+			// message and disconnect handlers are bound once.
+			if (turn !== login_turn) return;
+			// The form holds the address this login went to: a session restored since the click fills it from its record.
+			for (const name in sent) $(`[name=${name}]`).val(sent[name]);
 			console.log("Connected to the Archipelago server!", e);
-			try {
-				localStorage.setItem("datapackage_cache", JSON.stringify(client.package.exportPackage()));
-			}
-			catch (ex) {
-				console.log("Unable to cache datapackage.");
-				console.log(ex);
-			}
+			cache_packages();
 			slotData = e;
 			received_cache = null;
 			sent_units = 0;
@@ -46,8 +187,22 @@ $("<button>Connect!</button>").on("click", function () {
 			if (slotData.version) $("#appaint-version").text("APWorld Version " + slotData.version);
 			if (slotData.final_width) final_width = slotData.final_width;
 			if (slotData.final_height) final_height = slotData.final_height;
-			goal_canvas.width = final_width;
-			goal_canvas.height = final_height;
+			// The tab's session belongs to the game it first logs into, and a login into another game goes on in a new
+			// session (sessions.js, decision 7), before the goal and the canvas take this game's sizes.
+			loaded = { seed: client.room.seedName, team: client.players.self.team, slot: client.players.self.slot };
+			$G.triggerHandler("game-login", [{ ...loaded }]);
+			// A login into the game the goal canvas was last cleared for, at the same goal size, as a reconnect is, leaves
+			// the goal and the read of it alone: the goal image draws over it again at its load. Cleared here, the goal was
+			// blank until then, and a tick of auto copy in between copied from the blank read and could send every check.
+			const game = `${loaded.seed}-${loaded.team}-${loaded.slot}`;
+			if (game !== goal_game || goal_canvas.width !== final_width || goal_canvas.height !== final_height) {
+				goal_canvas.width = final_width;
+				goal_canvas.height = final_height;
+				// Blank until the goal image draws, at any size: a read of the last game's goal would score this game's
+				// canvas against it and send checks it hasn't earned.
+				drop_goal_pixels();
+			}
+			goal_game = game;
 			$goal.width(final_width)
 			$goal.height(final_height)
 			diff_canvas.width = final_width;
@@ -61,7 +216,9 @@ $("<button>Connect!</button>").on("click", function () {
 			$goal_image.attr("src", $goal_image.attr("src") ?? ("images/archipelago/" + final_width + "x" + final_height + ".png"));
 			$G.triggerHandler("save-connection-info");
 			$G.triggerHandler("restore-colors");
-			update();
+			// Every tool starts locked, as on a fresh page, so a tool the last game unlocked shows only if this one has it.
+			for (const tool of tools) tool.$button?.addClass("disabled");
+			update(true);
 			select_tool(default_tool);
 			if (slotData.death_link) {
 				client.deathLink.enableDeathLink();
@@ -76,6 +233,7 @@ $("<button>Connect!</button>").on("click", function () {
 				});
 			}
 			client.messages.on("message", onMessage);
+			items_taken = client.items.received.length;
 			client.items.on("itemsReceived", onReceive);
 			client.socket.on("disconnected", function () {
 				client.messages.off("message", onMessage);
@@ -86,9 +244,14 @@ $("<button>Connect!</button>").on("click", function () {
 		})
 		.catch(function (e) {
 			console.error(e);
-			alert(e);
+			// A login the player clicked past fails without an alert of its own: the latest click's login says it.
+			if (turn === login_turn) alert(e);
+		})
+		.finally(function () {
+			login_ended(turn);
 		});
 }).appendTo($ap_options_window.$content);
+$ap_status.appendTo($ap_options_window.$content);
 
 // Pain-T check IDs: the 18 checks below 0.01% are 2198900 + k, then 2199000 + i is the check at i * 0.01%.
 // The server drops IDs the options didn't create, so every step up to the similarity goes out once.
@@ -102,18 +265,21 @@ var sent_units = 0; // similarity already sent, in 0.0001% steps
 const MATCHED_BASE = 2198950;
 var matched_sent = 0;
 
+// The goal comes from the read every score shares (task 7.3), as wide as the goal canvas.
 function count_matched(limit) {
-	var w = Math.min(main_canvas.width, goal_canvas.width), h = Math.min(main_canvas.height, goal_canvas.height);
+	var goal = goal_pixels();
+	var w = Math.min(main_canvas.width, goal.width), h = Math.min(main_canvas.height, goal.height);
 	var canvas = main_canvas.ctx.getImageData(0, 0, w, h).data;
-	var goal = goal_canvas.ctx.getImageData(0, 0, w, h).data;
 	var count = 0;
-	for (var i = 0; i < canvas.length && count < limit; i += 4) {
-		var matched = canvas[i + 3] === 255;
-		for (var c = 0; c < 3 && matched; c++) {
-			var target = goal[i + c];
-			matched = Math.abs(canvas[i + c] - target) <= Math.abs(quantize(target, 2) - target) + 1;
+	for (var y = 0; y < h && count < limit; y++) {
+		for (var x = 0, i = y * w * 4, j = y * goal.width * 4; x < w && count < limit; x++, i += 4, j += 4) {
+			var matched = canvas[i + 3] === 255;
+			for (var c = 0; c < 3 && matched; c++) {
+				var target = goal.data[j + c];
+				matched = Math.abs(canvas[i + c] - target) <= Math.abs(quantize(target, 2) - target) + 1;
+			}
+			if (matched) count++;
 		}
-		if (matched) count++;
 	}
 	return count;
 }
@@ -156,7 +322,15 @@ function fake_session(slot_data, items, name = "test") {
 	for (const tool of tools) tool.$button?.addClass("disabled");
 	if (slotData.final_width) final_width = slotData.final_width;
 	if (slotData.final_height) final_height = slotData.final_height;
-	update();
+	update(true);
+}
+
+// Item packets for tests, beside fake_session(): the items arrive as a server's ReceivedItems would bring them, and the
+// page runs what it runs for a packet. fake_session() rescores as a login does; a packet rescores only for a new canvas
+// size (task 7.2).
+function fake_packet(items) {
+	fake_items = fake_items.concat(items);
+	onReceive(items.map((item) => ({ name: item.name ?? item })));
 }
 
 // Names this game for what the browser keeps per game, such as spent Overclock: seed, team and slot. The client keeps the
@@ -218,7 +392,9 @@ function game_changed() {
 function death_received() {
 	game_changes++;
 	reset_canvas_and_history();
-	update();
+	// The reset is a change to save, as a stroke is. It is asked for before update(), which can throw as it sends.
+	$G.triggerHandler("session-update");
+	update(true);
 }
 
 function handleTrap(name, isLinked, packet) {
@@ -321,9 +497,16 @@ function handleTrap(name, isLinked, packet) {
 	}
 }
 
-function onReceive(items) {
+// How many of the slot's items the page has taken: the login sets it to the items its answer brought. A server answers
+// each Connect with every item from index 0, and a login left waiting in the library sends its Connect on the next
+// login's socket, so a packet can bring again items whose traps have run. Only an item at or past this count runs its
+// trap. The library passes a packet's index beside its items.
+var items_taken = 0;
+function onReceive(items, index = items_taken) {
 	received_cache = null;
-	for (var item of items) {
+	const taken = Math.max(0, items_taken - index);
+	items_taken = Math.max(items_taken, index + items.length);
+	for (var item of items.slice(taken)) {
 		if (item.name.endsWith("Trap")) {
 			handleTrap(item.name, false, null);
 		}
@@ -335,11 +518,19 @@ function onMessage(message) {
 	$("#text-log").append("<br>" + $("<p>").text(message).html());
 }
 
-function update() {
+// The palette the Colors box was last built from, its length then, and the three channels' shade counts its buttons
+// were last rounded to.
+var built_palette = null, built_length = 0, built_shades = "";
+
+// Brings the page up to the items received: tools, palette, canvas size, views, ladders, and the similarity. A login, a
+// test's fake_session() and a DeathLink force a rescore. An item packet rescores only when the canvas has a size the last
+// rescore didn't score, and otherwise moves only the logic figure (task 7.2).
+function update(force = false) {
 	var c = 2;
 	var w = slotData.start_width ?? final_width / 2;
 	var h = slotData.start_height ?? final_height / 2;
-	for (var item of received()) {
+	var items = received();
+	for (var item of items) {
 		switch (item) {
 			case "Additional Palette Color":
 				c++;
@@ -376,14 +567,35 @@ function update() {
 	}
 	default_tool = get_tool_by_id("TOOL_" +
 		["Brush", "Pencil", "Eraser/Color Eraser", "Airbrush", "Line", "Rectangle", "Ellipse", "Rounded Rectangle"]
-			.filter((a) => received().includes(a))[0].split("/")[0].replace(" ", "_").toUpperCase());
+			.filter((a) => items.includes(a))[0].split("/")[0].replace(" ", "_").toUpperCase());
 	resize_canvas_without_saving_dimensions(w, h);
-	$colorbox.rebuild_palette(palette);
-	if (!mode_unlocked("Difference")) $diff.hide();
-	if (!mode_unlocked("Similarity")) $sim.hide();
+	// Building the Colors box lays the page out again, so it waits for a new color or a palette put in from elsewhere. A
+	// Progressive Color Depth item changes a channel's shades, and then the box rounds each stored color again and
+	// redraws only the buttons whose color moved.
+	var table = slotData.shade_counts ?? [2];
+	var shades = ["Red", "Green", "Blue"].map((channel) => table[Math.min(rungs(`Progressive Color Depth (${channel})`), table.length - 1)]).join();
+	if (palette !== built_palette || palette.length !== built_length) {
+		$colorbox.rebuild_palette(palette);
+		built_palette = palette;
+		built_length = palette.length;
+	} else if (shades !== built_shades) {
+		$colorbox.round_palette(palette);
+	}
+	built_shades = shades;
+	if (!mode_unlocked("Difference") && shown_view === "difference") show_view(null);
+	if (!mode_unlocked("Similarity") && shown_view === "similarity") show_view(null);
 	set_tool_ladders(slotData.tool_ladders ? rungs : null, tools); // D24: each painting tool starts one pixel wide
-	calculate_similarity();
+	if (force || !scored_at_size()) calculate_similarity();
+	else show_similarity(); // speed, accuracy, color and canvas items move logic's figure
 }
+
+// A new goal changes every pixel's score (task 7.2). The seed's loads after the login's rescore, and File > Open Goal
+// Image can bring one in any time. Before a game is loaded, the login rescores. This handler is bound before any other
+// for save-goal, so the goal as last read is dropped here, before anything judges against it (task 7.3).
+$G.on("save-goal", () => {
+	drop_goal_pixels();
+	if (session_name() !== "offline") calculate_similarity();
+});
 
 // How many copies of an item have arrived: the rungs of a ladder (D23), the speed tiers, the shades of a channel.
 function rungs(name) {
@@ -445,5 +657,5 @@ function version_below(version) {
 	return false;
 }
 
-export { death_received, deathlink, fake_session, final_height, final_width, game_changed, handleTrap, mode_unlocked, progression_rungs, received, rungs, send, session_name, show_text_client, slotData, version_below };
+export { death_received, deathlink, fake_packet, fake_session, final_height, final_width, game_changed, handleTrap, loaded_game, mode_unlocked, progression_rungs, received, rungs, send, session_name, show_text_client, slotData, update, version_below };
 

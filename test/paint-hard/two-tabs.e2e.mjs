@@ -9,8 +9,14 @@
 // it runs auto copy. Last, a resting tab closes while another runs, and another as its game's last tab; two more tabs
 // crash, one in a run the resting tab never saw and one after another run's stop; and two tabs without Web Locks fill
 // the bank beside each other's runs.
-// Usage: node test/paint-hard/two-tabs.e2e.mjs [--headful]. Set BROWSER_PATH if Chrome isn't in its default folder.
-import { cdp, check, finish, ORIGIN, overclock_id, sleep } from "./harness.mjs";
+// Usage: node test/paint-hard/two-tabs.e2e.mjs [--headful]. Set BROWSER_PATH if Chrome isn't in its default folder. It
+// runs in Chromium only: its tabs are DevTools Protocol targets, and its checks lean on Chrome's wakes for hidden tabs.
+import { BROWSER, cdp, check, chromium, finish, ORIGIN, overclock_id, sleep } from "./harness.mjs";
+
+if (!chromium) {
+	check(`two-tabs.e2e.mjs runs in Chrome, Edge or Brave, not ${BROWSER}`, false);
+	await finish();
+}
 
 const FULL_COLOR = [];
 for (const channel of ["Red", "Green", "Blue"]) for (let k = 0; k < 254; k++) FULL_COLOR.push(`Progressive Color Depth (${channel})`);
@@ -87,6 +93,7 @@ const set_up = (evaluate, slot, items, name = "test") => evaluate(async (slot, i
 	const image = goal_ctx.createImageData(width, height);
 	for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) image.data.set([(x * 3 + y) % 256, (y * 2 + 50) % 256, (x + y * 3) % 256, 255], (y * width + x) * 4);
 	goal_ctx.putImageData(image, 0, 0);
+	$G.triggerHandler("save-goal"); // as a goal the page draws does, so the page reads it again (task 7.3)
 	(await import("/src/functions.js")).set_magnification(1);
 	return at;
 }, slot, items, name);

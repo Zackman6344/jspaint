@@ -930,11 +930,22 @@ html, body, .jspaint {
 	display: block;
 }
 .storage-manager .thumbnail-container {
-	width: 128px;
+	width: 134px;
 	height: 64px;
 	display: flex;
 	align-items: center;
 	justify-content: center;
+	gap: 6px;
+}
+.storage-manager .session-details .part {
+	display: block;
+	white-space: nowrap;
+}
+.storage-manager .session-details .part.wraps {
+	white-space: normal;
+}
+.storage-manager .session-details .between {
+	display: none;
 }
 .storage-manager .thumbnail-container > img {
 	max-width: 64px;

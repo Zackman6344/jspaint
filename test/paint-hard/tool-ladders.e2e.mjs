@@ -3,7 +3,7 @@
 // fills Paint makes by itself, and voice commands. It stands in for a game with fake_session() from
 // src/archipelago.js, as auto-copy.e2e.mjs does, and paints with trusted mouse and keyboard input.
 // Usage: node test/paint-hard/tool-ladders.e2e.mjs [--headful]. Set BROWSER_PATH if Chrome isn't in its default folder.
-import { call, check, evaluate, finish, keyboard, mouse, open_paint, page, page_errors, point_on, same, sleep } from "./harness.mjs";
+import { add_init_script, call, check, evaluate, finish, keyboard, mouse, open_paint, page_errors, point_on, same, sleep } from "./harness.mjs";
 
 // Lets the test reach the speech recognizer Paint makes in #speech-recognition-mode. Headless Chrome has no microphone,
 // so start and stop do nothing; the test hands the result handler what Chrome would hear.
@@ -85,7 +85,7 @@ const not_white = () => evaluate(() => {
 });
 
 try {
-	await page("Page.addScriptToEvaluateOnNewDocument", { source: SPEECH_STUB });
+	await add_init_script(SPEECH_STUB);
 	await open_paint(undefined, { hide_connection_window: false });
 
 	// 0. Before a game connects: Escape leaves the connection window up, and the page counts as a ladder seed with no
@@ -320,7 +320,8 @@ try {
 		await mouse.click(5, 895); // the status bar, for the keys
 		await sleep(100);
 		const steps = await evaluate(() => undos.length);
-		for (const type of ["rawKeyDown", "keyUp"]) await page("Input.dispatchKeyEvent", { type, key: "w", code: "KeyW", windowsVirtualKeyCode: 87, modifiers: 3 });
+		await keyboard.down("w", ["Control", "Alt"]);
+		await keyboard.up("w", ["Control", "Alt"]);
 		await sleep(300);
 		const opened = await evaluate(() => {
 			const shown = [...document.querySelectorAll(".stretch-and-skew")].filter((w) => w.offsetParent !== null);

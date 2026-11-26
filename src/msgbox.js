@@ -105,6 +105,10 @@ function showMessageBox_implementation({
 		$window.$content.css({
 			textAlign: "center",
 		});
+		// A message that opens while the player types in the connection window's form (archipelago.js) leaves the focus
+		// in that field. With the focus, its button would take the next keys, and Space or Enter would close the message
+		// unread. A click on its button closes it.
+		const typing = !!document.activeElement?.matches?.(".ap-options-window input");
 		for (const button of buttons) {
 			const $button = $window.$Button(button.label, () => {
 				button.action?.(); // API may be required for using user gesture requiring APIs
@@ -113,8 +117,10 @@ function showMessageBox_implementation({
 			});
 			if (button.default) {
 				$button.addClass("default");
-				$button.focus();
-				setTimeout(() => $button.focus(), 0); // @TODO: why is this needed? does it have to do with the iframe window handling?
+				if (!typing) {
+					$button.focus();
+					setTimeout(() => $button.focus(), 0); // @TODO: why is this needed? does it have to do with the iframe window handling?
+				}
 			}
 			$button.css({
 				minWidth: 75,

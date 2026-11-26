@@ -4,7 +4,7 @@
 // stopped auto copy and M for most of a game (the second Phase 3 review).
 // Usage: node test/paint-hard/brave-noise.e2e.mjs [--headful]. Set BROWSER_PATH if Chrome isn't in its default folder.
 import { brave_noise_source, farble } from "./brave-model.mjs";
-import { check, evaluate, finish, keyboard, mouse, open_paint, page, page_errors, point_on, sleep } from "./harness.mjs";
+import { add_init_script, check, evaluate, finish, keyboard, mouse, open_paint, page_errors, point_on, remove_init_script, sleep } from "./harness.mjs";
 
 const TOKEN = "00112233445566778899aabbccddeeff";
 const COLORS = [[12, 200, 77], [255, 128, 0], [90, 90, 250], [131, 7, 190]]; // the parity check's four
@@ -40,6 +40,7 @@ const stage = (items, width, height, slot = SLOT_DATA) => evaluate(async (slot, 
 	const image = goal_ctx.createImageData(goal_canvas.width, goal_canvas.height);
 	for (let y = 0; y < goal_canvas.height; y++) for (let x = 0; x < goal_canvas.width; x++) image.data.set([(x * 3 + y) % 256, (y * 2 + 50) % 256, (x + y * 3) % 256, 255], (y * goal_canvas.width + x) * 4);
 	goal_ctx.putImageData(image, 0, 0);
+	$G.triggerHandler("save-goal"); // as a goal the page draws does, so the page reads it again (task 7.3)
 	main_ctx.fillStyle = "#fff";
 	main_ctx.fillRect(0, 0, width, height);
 	set_magnification(1);
@@ -68,7 +69,7 @@ const press_m = (x, y) => evaluate((x, y) => new Promise((resolve) => {
 }), x, y);
 
 try {
-	const { identifier } = await page("Page.addScriptToEvaluateOnNewDocument", { source: brave_noise_source(TOKEN) });
+	const noise = await add_init_script(brave_noise_source(TOKEN));
 	await open_paint(ready);
 
 	// The model itself: its SHA-256, and its 1x1 reads against Node's crypto.
@@ -95,6 +96,7 @@ try {
 		const image = goal_ctx.createImageData(width, height); // a goal with lots of different colors
 		for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) image.data.set([(x * 3 + y) % 256, (y * 2 + 50) % 256, (x + y * 3) % 256, 255], (y * width + x) * 4);
 		goal_ctx.putImageData(image, 0, 0);
+		$G.triggerHandler("save-goal");
 		functions.set_magnification(1);
 	});
 	await sleep(300);
@@ -150,6 +152,7 @@ try {
 		const image = goal_ctx.createImageData(30, 20);
 		for (let y = 0; y < 20; y++) for (let x = 0; x < 30; x++) image.data.set([76 + (x % 2), 0, 76 + (y % 2), 255], (y * 30 + x) * 4);
 		goal_ctx.putImageData(image, 0, 0);
+		$G.triggerHandler("save-goal");
 	});
 	const six = await run_until_stopped(20000);
 	check("...and at 6 shades, on a goal at the shade boundaries", six.done && six.left === 0, JSON.stringify(six));
@@ -203,7 +206,7 @@ try {
 
 	// 8. Reads that turn blocked while M is held, on a page without the noise: M lets go at its next read-back, paints
 	// nothing more, and says why. 16 pixels a second, so M's line waits on the allowance.
-	await page("Page.removeScriptToEvaluateOnNewDocument", { identifier });
+	await remove_init_script(noise);
 	await open_paint(ready);
 	await stage([...color_items(254), ...Array(4).fill("Progressive Auto Copy Speed"), ...SURE], 100, 100);
 	const m_blocked = await evaluate(async () => {
@@ -233,14 +236,14 @@ try {
 
 	// 9. A browser that blocks canvas reads from the start, every read 16 levels off: the page finds it as it loads, and
 	// auto copy and M say so rather than paint.
-	await page("Page.addScriptToEvaluateOnNewDocument", { source: `(() => {
+	await add_init_script(`(() => {
 		const read = CanvasRenderingContext2D.prototype.getImageData;
 		CanvasRenderingContext2D.prototype.getImageData = function (...args) {
 			const image = read.apply(this, args);
 			for (let i = 0; i < image.data.length; i += 4) image.data[i] ^= 16;
 			return image;
 		};
-	})();` });
+	})();`);
 	await open_paint(ready);
 	const blocked = await hook("read_noise");
 	await stage([...color_items(254), ...SPEED, ...SURE], 30, 20);

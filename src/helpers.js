@@ -403,8 +403,8 @@ function to_canvas_coords({ clientX, clientY }, allow_goal) {
 	const canvas = use_main_canvas ? main_canvas : goal_canvas;
 	const rect = use_main_canvas ? main_rect : goal_rect;
 	return {
-		x: ~~((clientX - rect.left) / rect.width * canvas.width),
-		y: ~~((clientY - rect.top) / rect.height * canvas.height),
+		x: Math.floor((clientX - rect.left) * canvas.width / rect.width),
+		y: Math.floor((clientY - rect.top) * canvas.height / rect.height),
 	};
 }
 /**

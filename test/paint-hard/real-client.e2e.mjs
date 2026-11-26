@@ -1,30 +1,19 @@
 // End-to-end test of Pain-T through its real Archipelago client: what reaches the server and what survives a dropped
-// connection. Before the page loads, window.WebSocket is replaced by a stand-in for MultiServer that answers RoomInfo,
-// GetDataPackage (built from the APWorld's items.py), Connect and Get, records LocationChecks, and can drop the
-// connection; the page logs in through its own Connect button. Last, the page logs in to a second seed, one with
-// starting_color_depth 1, whose items come as a server sends start inventory and cheat items, for logic's ceiling.
-// Adapted from the Phase 3 review's harness.
+// connection, the goal among it. Before the page loads, window.WebSocket is replaced by a stand-in for MultiServer
+// (stand-in-server.mjs), and the page logs in through its own Connect button. Last, the page logs in to a second seed,
+// one with starting_color_depth 1, whose items come as a server sends start inventory and cheat items, for logic's
+// ceiling.
 // Usage: node test/paint-hard/real-client.e2e.mjs [--headful]. It reads items.py and test/client_contract.json from the
 // APWorld checkout beside this one; set PAIN_T_ITEMS_PY and PAIN_T_CONTRACT to read them from elsewhere.
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { miss_margin, miss_percent } from "../../src/misses.js";
-import { check, evaluate, finish, mouse, open_paint, overclock_id, page, page_errors, same, sleep } from "./harness.mjs";
+import { add_init_script, check, evaluate, finish, keyboard, mouse, open_paint, page_errors, reload_paint, remove_init_script, same, sleep } from "./harness.mjs";
+import { CONTRACT, CONTRACT_JSON, ITEMS, ITEMS_PY, LOCATIONS, connect, fake_server, id_of, window_shown } from "./stand-in-server.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
-const WORLD = path.join(ROOT, "..", "paint-hard-apworld", "worlds", "paint_hard");
-const ITEMS_PY = process.env.PAIN_T_ITEMS_PY || path.join(WORLD, "items.py");
-// What the world writes for the client beyond items.py: each tool ladder's copies, the accuracy copies, the margin copies
-// at the default miss_margin_step, the slot data at the default options, and what logic's ceiling is checked against
-// (its test_client_contract.py keeps the file true).
-const CONTRACT_JSON = process.env.PAIN_T_CONTRACT || path.join(WORLD, "test", "client_contract.json");
-const CONTRACT = JSON.parse(fs.readFileSync(CONTRACT_JSON, "utf8")), LOGIC = CONTRACT.logic;
-
-// The item table, from items.py itself, so a name that differs between the two repos fails here.
-const ITEMS = {};
-for (const m of fs.readFileSync(ITEMS_PY, "utf8").matchAll(/^\s*"([^"]+)":\s*PaintItemData\((\d+),/gm)) ITEMS[m[1]] = Number(m[2]);
-const id_of = (name) => { if (!(name in ITEMS)) throw new Error(`not in items.py: ${name}`); return ITEMS[name]; };
+const LOGIC = CONTRACT.logic;
 
 const names = ["Magnifier", "Brush"];
 for (let k = 0; k < 254; k++) names.push("Progressive Color Depth (Red)", "Progressive Color Depth (Green)", "Progressive Color Depth (Blue)");
@@ -45,11 +34,6 @@ const flags_of = (name) => (name === "Overclock" ? 0 : name === "Progressive Aut
 const LATE_ITEM = { item: id_of("Progressive Canvas Width"), location: 2199000 + 9000 + names.length, player: 1, flags: 1 };
 const START_ITEMS = names.map((name, i) => ({ item: id_of(name), location: 2199000 + 9000 + i, player: 1, flags: flags_of(name) }));
 
-// Locations as a default 800x600 seed has them: 18 early checks, 25 Matched Pixels, a check every 0.01% up to 80%.
-const LOCATIONS = [];
-for (let k = 1; k <= 18; k++) LOCATIONS.push(2198900 + k);
-for (let n = 1; n <= 25; n++) LOCATIONS.push(2198950 + n);
-for (let i = 1; i <= 8000; i++) LOCATIONS.push(2199000 + i);
 // The world's own slot data at its defaults, with only what this test needs changed. Each changed key has to be one the
 // world writes, so a rename on that side can't hide behind a value typed here. miss_margin_step is 5 rather than the
 // default 1, so a client that read the key and went on at a step of 1 would show. The version is the world's, 1.1.0
@@ -63,63 +47,15 @@ const START_SLOT_DATA = { ...CONTRACT.slot_data, ...LOGIC.slot_data_changes.star
 const START_INVENTORY = LOGIC.start_inventory.map((name) => ({ item: id_of(name), location: -2, player: 0, flags: 0 }));
 const START_CONFIG = { ...CONFIG, seed: "SEED43", items: START_INVENTORY, slot_data: START_SLOT_DATA };
 
-// The stand-in server, in the page. It keeps what was checked in sessionStorage, so a reload sees it.
-const fake_server = (config) => `(() => {
-	const CONFIG = ${JSON.stringify(config)};
-	// The seconds the game's Overclock fillers have given, added up over every page's totals (auto-copy.js).
-	window.spent_stored = () => Object.keys(localStorage).filter((key) => key.startsWith("pain-t-overclock-page:" + CONFIG.seed + "-0-1:")).reduce((sum, key) => sum + JSON.parse(localStorage.getItem(key)).spent, 0);
-	const store = (() => { try { return JSON.parse(sessionStorage.getItem("fake-ap:" + CONFIG.seed) || "null"); } catch { return null; } })() || { checked: [] };
-	const save = () => { try { sessionStorage.setItem("fake-ap:" + CONFIG.seed, JSON.stringify(store)); } catch { } };
-	const ap = window.__ap = {
-		log: [], sockets: [], received: 0,
-		drop() { const s = ap.sockets.at(-1); if (s) s._drop(); },
-		// One more item for this slot, as another player's check would send it.
-		push(item = CONFIG.late_item.item) { const s = ap.sockets.at(-1); if (!s) return; s._reply([{ cmd: "ReceivedItems", index: ap.received, items: [{ ...CONFIG.late_item, item }] }]); ap.received++; },
-		// Items as the server sends them, in one packet.
-		give(items) { const s = ap.sockets.at(-1); if (!s) return; s._reply([{ cmd: "ReceivedItems", index: ap.received, items }]); ap.received += items.length; },
-	};
-	class FakeWebSocket {
-		constructor(url) {
-			this.url = String(url); this.readyState = 0; ap.sockets.push(this);
-			setTimeout(() => { this.readyState = 1; this.onopen?.({}); this._reply([{ cmd: "RoomInfo", version: { major: 0, minor: 6, build: 6, class: "Version" }, generator_version: { major: 0, minor: 6, build: 6, class: "Version" }, tags: [], password: false, permissions: { release: 2, collect: 2, remaining: 2 }, hint_cost: 10, location_check_points: 1, games: ["Archipelago", "Pain-T"], datapackage_checksums: { "Pain-T": CONFIG.package.checksum }, seed_name: CONFIG.seed, time: Date.now() / 1000 }]); }, 10);
-		}
-		send(text) {
-			for (const p of JSON.parse(text)) {
-				ap.log.push({ t: performance.now(), cmd: p.cmd, locations: p.locations, status: p.status });
-				if (p.cmd === "GetDataPackage") this._reply([{ cmd: "DataPackage", data: { games: { "Pain-T": CONFIG.package } } }]);
-				else if (p.cmd === "Connect") {
-					const missing = CONFIG.locations.filter((id) => !store.checked.includes(id));
-					this._reply([{ cmd: "Connected", team: 0, slot: 1, players: [{ team: 0, slot: 1, alias: p.name, name: p.name, class: "NetworkPlayer" }], missing_locations: missing, checked_locations: [...store.checked], slot_data: CONFIG.slot_data, slot_info: { 1: { name: p.name, game: "Pain-T", type: 1, group_members: [], class: "NetworkSlot" } }, hint_points: 0 }, { cmd: "ReceivedItems", index: 0, items: CONFIG.items }]);
-					ap.received = CONFIG.items.length;
-				} else if (p.cmd === "LocationChecks") {
-					const fresh = p.locations.filter((id) => CONFIG.locations.includes(id) && !store.checked.includes(id));
-					store.checked.push(...fresh); save();
-					if (fresh.length) this._reply([{ cmd: "RoomUpdate", checked_locations: fresh }]);
-				} else if (p.cmd === "Get") this._reply([{ cmd: "Retrieved", keys: Object.fromEntries(p.keys.map((k) => [k, k.startsWith("_read_hints") ? [] : null])) }]);
-			}
-		}
-		close() { this.readyState = 3; }
-		_reply(packets) { setTimeout(() => { if (this.readyState === 1) this.onmessage?.({ data: JSON.stringify(packets) }); }, 2); }
-		_drop() { if (this.readyState === 3) return; this.readyState = 3; this.onclose?.({ code: 1006 }); }
-	}
-	Object.assign(FakeWebSocket, { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 });
-	window.WebSocket = FakeWebSocket;
-})();`;
 const FAKE_SERVER = fake_server(CONFIG);
 
 const ready = () => typeof goal_canvas !== "undefined" && main_canvas.width > 0 && !!window.paint_hard_auto_copy;
 const shift_m = async () => {
-	for (const type of ["keyDown", "keyUp"]) await page("Input.dispatchKeyEvent", { type, key: "M", code: "KeyM", windowsVirtualKeyCode: 77, text: type === "keyDown" ? "M" : undefined, modifiers: 8 });
-	await sleep(150);
+	await keyboard.press("m", ["Shift"]);
+	await sleep(50);
 };
 const panel_text = () => evaluate(() => { const p = document.querySelector(".auto-copy-panel"); return p && p.offsetParent !== null ? p.querySelector(".window-content").innerText.replace(/\s+/g, " ").trim() : null; });
 const session = () => evaluate(async () => (await import("/src/archipelago.js")).session_name());
-const window_shown = () => evaluate(() => [...document.querySelectorAll(".window")].some((w) => /Archipelago Connection Options/.test(w.textContent) && w.offsetParent !== null));
-const connect = async () => {
-	await evaluate(() => { $("[name=aphost]").val("fake.test"); $("[name=apport]").val("38281"); $("[name=apslot]").val("Painter"); $("button").filter((i, b) => b.textContent === "Connect!").trigger("click"); });
-	for (let i = 0; i < 100 && (await window_shown()); i++) await sleep(100);
-	await sleep(500);
-};
 
 // Logic's ceiling in the second seed. What the client holds of each item the ceiling reads, in this order, how many of
 // each it counts, and the ceiling.
@@ -186,7 +122,7 @@ try {
 	const unread = [...READ_KEYS].filter((key) => !CONTRACT.slot_data_keys.includes(key) && !OLDER_SEEDS_ONLY.includes(key));
 	const from_today = [...READ_KEYS].filter((key) => !OLDER_SEEDS_ONLY.includes(key));
 	check("every slot data key the client reads is one the world writes", READ_KEYS.size >= 15 && unread.length === 0 && UNNAMED_READS.length === 0, unread.length ? `not written: ${unread.join(", ")}` : UNNAMED_READS.length ? `reads the scan can't name: ${UNNAMED_READS.join("; ")}` : `${from_today.length} keys read from today's seeds, and ${OLDER_SEEDS_ONLY.length} only older seeds wrote`);
-	const { identifier: first_server } = await page("Page.addScriptToEvaluateOnNewDocument", { source: FAKE_SERVER });
+	const first_server = await add_init_script(FAKE_SERVER);
 	await open_paint(ready, { hide_connection_window: false });
 	check("items.py has the names this test sends", names.every((name) => name in ITEMS), `${Object.keys(ITEMS).length} items read from ${ITEMS_PY}`);
 	check("before connecting, the session is offline", (await session()) === "offline", await session());
@@ -241,8 +177,9 @@ try {
 	check("...no ID twice", run.unique === run.ids, `${run.unique} unique of ${run.ids}`);
 	check("...at most one LocationChecks a second after the first", run.gaps.slice(1).every((g) => g >= 950), run.gaps.join(","));
 	check("...the spent Overclock kept under the seed-team-slot key", run.spent >= 4 - 1e-6, String(run.spent));
-	// update() still scores the whole canvas on every packet, up to about 60 ms here, until task 7.2 limits it to a new
-	// canvas size. Before the Phase 3 review's fix each packet also rebuilt the rounding tables, 300-400 ms at 8,000 items.
+	// Since task 7.2 a packet rescores only for a new canvas size, which scoring.e2e.mjs counts; before, each scored the
+	// whole canvas, up to about 60 ms here. Before the Phase 3 review's fix each packet also rebuilt the rounding tables,
+	// 300-400 ms at 8,000 items.
 	let held = 0;
 	for (let i = 0; i < 20 && held < names.length + 9; i++) {
 		held = await evaluate(async () => (await import("/src/archipelago.js")).received().length);
@@ -251,8 +188,65 @@ try {
 	check("...no task over 100 ms while it runs at 1,024 a second with 8,000 items and a packet a second", held >= names.length + 9 && run.long_tasks.every((t) => t.ms < 100), `${held} items; ${JSON.stringify(run.long_tasks)}`);
 	check("...and a short start", run.first_long_tasks.every((t) => t.ms < 500), JSON.stringify(run.first_long_tasks));
 
+	// The goal through a reconnect (R7): a login into the game the goal canvas was last cleared for, at the same goal size,
+	// leaves the goal canvas and its read alone, and the goal image's load clears the goal canvas before it draws. Until the
+	// reload below, the page's own handler for that load runs 150 ms late, as a slow load makes it, so a goal the login
+	// cleared would stay blank that long, and auto copy would copy from it. The page logs each clear of the goal canvas,
+	// each draw of the goal image, each 1x1 put that is black where the goal isn't, and each LocationChecks with what the
+	// canvas had earned against the goal as it went out.
+	const GOAL_HOLD = 150;
+	await evaluate((hold) => {
+		const real_get = CanvasRenderingContext2D.prototype.getImageData, real_put = CanvasRenderingContext2D.prototype.putImageData, real_draw = CanvasRenderingContext2D.prototype.drawImage;
+		const watch = window.__goal_watch = { clears: [], draws: [], black: [], puts: [], sends: [] };
+		// The goal the page holds, read again when the test draws another.
+		watch.read_goal = () => { const { width, height } = goal_canvas; watch.goal = { width, height, data: real_get.call(goal_ctx, 0, 0, width, height).data }; };
+		watch.read_goal();
+		// What the canvas has earned against that goal, in 0.0001% units, by the formula of 0.5.0 and later.
+		watch.earned = () => {
+			const { width, height, data: g } = watch.goal, c = real_get.call(main_ctx, 0, 0, width, height).data;
+			let sum = 0;
+			for (let i = 0; i < g.length; i += 4) {
+				const dr = c[i] - g[i], dg = c[i + 1] - g[i + 1], db = c[i + 2] - g[i + 2];
+				sum += 2 * (1 - Math.sqrt((dr * dr + dg * dg + db * db) / 3) / 255) - 1;
+			}
+			return Math.floor(sum * 100 / (width * height) * 10000 + 1e-7);
+		};
+		const width_of = Object.getOwnPropertyDescriptor(HTMLCanvasElement.prototype, "width");
+		Object.defineProperty(goal_canvas, "width", { configurable: true, get() { return width_of.get.call(this); }, set(value) { watch.clears.push(performance.now()); width_of.set.call(this, value); } });
+		goal_ctx.drawImage = function (image, ...rest) { if (image instanceof HTMLImageElement) watch.draws.push(performance.now()); return real_draw.call(this, image, ...rest); };
+		main_ctx.putImageData = function (image, x, y, ...rest) {
+			if (image.width === 1 && image.height === 1) {
+				const t = performance.now(), d = image.data, g = watch.goal.data, j = (y * watch.goal.width + x) * 4;
+				watch.puts.push(t);
+				if (watch.puts.length > 20000) watch.puts.splice(0, 10000);
+				if (d[0] === 0 && d[1] === 0 && d[2] === 0 && (g[j] || g[j + 1] || g[j + 2])) watch.black.push(t);
+			}
+			return real_put.call(this, image, x, y, ...rest);
+		};
+		// Each connection's socket is of one class.
+		const EARLY = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 30, 40, 50, 60, 70, 80, 90];
+		const socket = Object.getPrototypeOf(__ap.sockets.at(-1)), real_send = socket.send;
+		socket.send = function (text) {
+			for (const p of JSON.parse(text)) {
+				if (p.cmd !== "LocationChecks") continue;
+				const units = p.locations.map((id) => (id > 2198900 && id <= 2198918 ? EARLY[id - 2198901] : id > 2199000 ? (id - 2199000) * 100 : 0));
+				watch.sends.push({ t: performance.now(), checks: p.locations.length, highest: Math.max(0, ...units), earned: watch.earned() });
+			}
+			return real_send.call(this, text);
+		};
+		const image = $goal_image[0], draw = image.onload;
+		image.onload = function (event) { setTimeout(() => draw.call(this, event), hold); };
+	}, GOAL_HOLD);
+	// What the page logged since `mark`: the goal canvas's clears and the goal image's draws, the black puts, the puts made
+	// after the goal drew, and the sends whose highest check passes what the canvas had earned.
+	const goal_since = (mark) => evaluate((mark) => {
+		const watch = window.__goal_watch, after = (list) => list.filter((entry) => (entry.t ?? entry) > mark);
+		const clears = after(watch.clears), draws = after(watch.draws), sends = after(watch.sends);
+		return { clears: clears.length, draws: draws.length, black: after(watch.black).length, puts_after_draw: draws.length ? after(watch.puts).filter((t) => t > draws[0]).length : 0, sends: sends.length, unearned: sends.filter((s) => s.highest > Math.max(0, s.earned)).map((s) => ({ checks: s.checks, highest: s.highest, earned: s.earned })).slice(0, 3) };
+	}, mark);
+
 	// The connection drops: the items stay with the client, and so does the session's name.
-	await evaluate(() => __ap.drop());
+	const dropped_at = await evaluate(() => { const at = performance.now(); __ap.drop(); return at; });
 	await sleep(2500);
 	const dropped = await evaluate(async () => {
 		const ap = await import("/src/archipelago.js");
@@ -267,12 +261,60 @@ try {
 	await sleep(2500);
 	const back = await evaluate(() => ({ banked: paint_hard_auto_copy.overclock_banked(), resent: __ap.log.filter((p) => p.cmd === "LocationChecks").flatMap((p) => p.locations).filter((id) => id <= 2198975).length }));
 	check("reconnecting sends no early check or Matched Pixel again, and keeps the spent seconds", back.resent === 0 && back.banked === 0, JSON.stringify(back));
-	await shift_m(); // pause
-	await page("Page.reload", {});
-	await sleep(500);
-	for (let i = 0; i < 200 && !(await evaluate(ready).catch(() => false)); i++) await sleep(100);
-	await sleep(500);
-	await overclock_id();
+	const reconnected = await goal_since(dropped_at);
+	check("a reconnect into the same game leaves the goal as it was: with the goal's draw held 150 ms, auto copy paints no pixel black where the goal isn't, and goes on once the goal has drawn", reconnected.black === 0 && reconnected.draws >= 1 && reconnected.puts_after_draw > 0, JSON.stringify(reconnected));
+
+	// The worst case, as UN2's verdict found it: a dark goal, drawn as one File > Open Goal Image brings, and the canvas
+	// filled black as a player's dark base, which earns a good part of the goal. Auto copy is paused for the fill and runs
+	// again without Loop right after it, which it starts at once, and the connection drops 2.5 s later, for 1.2 s. A tick
+	// that read a blank goal would take every black pixel for done, run to its pass's end and score the whole canvas
+	// against the blank goal there, which sends every check and the goal.
+	if (await evaluate(() => window.paint_hard_auto_copy.running())) await shift_m(); // pause
+	await evaluate(() => window.paint_hard_auto_copy.set_loop(false));
+	// The dark goal, with its rows from `see_through` on at half alpha, as the goal image.
+	const dark_goal = (see_through) => evaluate((see_through) => {
+		const dark = document.createElement("canvas");
+		dark.width = 800;
+		dark.height = 600;
+		const context = dark.getContext("2d"), image = context.createImageData(800, 600), d = image.data;
+		for (let y = 0, i = 0; y < 600; y++) for (let x = 0; x < 800; x++, i += 4) d.set([20 + (x * 3 + y) % 60, 30 + (y * 2) % 50, 25 + (x + y * 3) % 70, y < see_through ? 255 : 128], i);
+		context.putImageData(image, 0, 0);
+		$goal_image.attr("src", dark.toDataURL("image/png"));
+	}, see_through);
+	await dark_goal(600);
+	const dark_drawn = () => evaluate(() => { const [r, g, b] = goal_ctx.getImageData(400, 300, 1, 1).data; return r === 20 + (400 * 3 + 300) % 60 && g === 30 + (300 * 2) % 50 && b === 25 + (400 + 300 * 3) % 70; });
+	for (let i = 0; i < 50 && !(await dark_drawn()); i++) await sleep(100);
+	await sleep(300); // the new goal's rescore
+	await evaluate(async () => {
+		window.__goal_watch.read_goal();
+		(await import("/src/functions.js")).undoable({ name: "Fill With Color" }, () => { main_ctx.fillStyle = "#000000"; main_ctx.fillRect(0, 0, main_canvas.width, main_canvas.height); });
+	});
+	await shift_m(); // run again
+	await sleep(2500);
+	const base = await evaluate(() => ({ running: window.paint_hard_auto_copy.running(), loop: window.paint_hard_auto_copy.loop(), earned: window.__goal_watch.earned() }));
+	const dark_at = await evaluate(() => { const at = performance.now(); __ap.drop(); return at; });
+	for (let i = 0; i < 50 && !(await window_shown()); i++) await sleep(100);
+	await sleep(1200);
+	await connect();
+	await sleep(1500 + GOAL_HOLD);
+	const dark = { ...(await goal_since(dark_at)), ...(await evaluate((mark) => ({ goal_sent: __ap.log.some((p) => p.cmd === "StatusUpdate" && p.status === 30 && p.t > mark), earned_now: window.__goal_watch.earned(), running: window.paint_hard_auto_copy.running() }), dark_at)) };
+	check("...and with a dark goal and the canvas filled black, auto copy running without Loop sends no check through a reconnect that the canvas hasn't earned, and not the goal", base.running && !base.loop && base.earned > 0 && dark.unearned.length === 0 && !dark.goal_sent, JSON.stringify({ base, ...dark }));
+	if (await evaluate(() => window.paint_hard_auto_copy.running())) await shift_m(); // pause
+	// The same goal with its bottom 10 rows half see-through, through one more reconnect. Drawn over its own last draw,
+	// a pixel at half alpha would come out at three quarters.
+	const draws_before = await evaluate(() => window.__goal_watch.draws.length);
+	await dark_goal(590);
+	for (let i = 0; i < 50 && (await evaluate(() => window.__goal_watch.draws.length)) === draws_before; i++) await sleep(100);
+	const alpha_now = () => evaluate(() => goal_ctx.getImageData(400, 595, 1, 1).data[3]);
+	const first_drawn = await alpha_now();
+	const see_through_at = await evaluate(() => { const at = performance.now(); __ap.drop(); return at; });
+	for (let i = 0; i < 50 && !(await window_shown()); i++) await sleep(100);
+	await sleep(300);
+	await connect();
+	await sleep(1000 + GOAL_HOLD);
+	const redrawn = { first_drawn, draws: (await goal_since(see_through_at)).draws, alpha: await alpha_now() };
+	check("...and the goal image's draw at the reconnect starts from a clear goal canvas: its half see-through rows stay at half alpha", redrawn.draws >= 1 && Math.abs(redrawn.alpha - 128) <= 1, JSON.stringify(redrawn));
+	await reload_paint(ready, { hide_connection_window: false });
 	await connect();
 	const reloaded = await evaluate(() => ({ banked: paint_hard_auto_copy.overclock_banked(), key: spent_stored() }));
 	check("after a reload and reconnect the spent seconds are restored", reloaded.banked === 0 && reloaded.key >= 4 - 1e-6, JSON.stringify(reloaded));
@@ -319,14 +361,11 @@ try {
 	// flags 0. A !getitem width comes at location -1 from the slot itself, with flags 0 (MultiServer.py:1663), beside a
 	// found height. Then every color and canvas item, Pick Color, 2 accuracy copies, and 5 speed copies, 3 progression and
 	// 2 useful: the 3 get 51,840 pixels right in the world's 6 h, and the 5 would get 207,360. Last, the rest of the speed
-	// and accuracy copies.
-	await page("Page.removeScriptToEvaluateOnNewDocument", { identifier: first_server });
-	await page("Page.addScriptToEvaluateOnNewDocument", { source: fake_server(START_CONFIG) });
-	await page("Page.reload", {});
-	await sleep(500);
-	for (let i = 0; i < 200 && !(await evaluate(ready).catch(() => false)); i++) await sleep(100);
-	await sleep(500);
-	await overclock_id();
+	// and accuracy copies. The reloaded page restores SEED42's canvas, and the login into SEED43 leaves that session's
+	// record as it is and goes on in a new one (task 7.5).
+	await remove_init_script(first_server);
+	await add_init_script(fake_server(START_CONFIG));
+	await reload_paint(ready, { hide_connection_window: false });
 	await connect();
 	const start = await logic_now();
 	check("start inventory, sent at location -2 with flags 0, counts toward logic's ceiling as the world counts it: the start of a seed with starting_color_depth 1", start.session === "SEED43-0-1" && same(LOGIC.start_inventory.slice(0, 2), ["Magnifier", "Brush"]) && start.counted === "1,1,1,0,0,0,0,0" && close(start.ceiling, world_ceiling([1, 0, 0, 0, 0, false])), JSON.stringify({ ...start, world: world_ceiling([1, 0, 0, 0, 0, false]), start_inventory: LOGIC.start_inventory }));

@@ -4,7 +4,7 @@
 // to count as received); real-client.e2e.mjs covers the real client. It draws a known goal, as the Copy Goal test it was
 // ported from did.
 // Usage: node test/paint-hard/auto-copy.e2e.mjs [--headful]. Set BROWSER_PATH if Chrome isn't in its default folder.
-import { call, check, evaluate, finish, keyboard, mouse, open_paint, overclock_id, overclock_stored, page, page_errors, point_on, same, sleep } from "./harness.mjs";
+import { add_init_script, call, check, evaluate, finish, keyboard, mouse, open_paint, overclock_id, overclock_stored, page_errors, point_on, remove_init_script, same, sleep } from "./harness.mjs";
 
 // --- The game, stood in for ---
 const FULL_COLOR = [];
@@ -39,6 +39,7 @@ try {
 		const image = goal_ctx.createImageData(width, height); // a goal with lots of different colors
 		for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) image.data.set([(x * 3 + y) % 256, (y * 2 + 50) % 256, (x + y * 3) % 256, 255], (y * width + x) * 4);
 		goal_ctx.putImageData(image, 0, 0);
+		$G.triggerHandler("save-goal"); // as a goal the page draws does, so the page reads it again (task 7.3)
 		functions.set_magnification(1);
 	}, SLOT_DATA, [...FULL_COLOR, ...speed_items(10), ...SURE]);
 	await sleep(300);
@@ -1012,12 +1013,13 @@ try {
 	check("...and its running total is the imported canvas's", after_import.running !== null && Math.abs(after_import.running - after_import.full) < 1e-9 && after_import.full < before_import.full - 10, `${JSON.stringify(before_import)} -> ${JSON.stringify(after_import)}`);
 	await keyboard.press("m", ["Shift"]); // pause
 
-	// If copying fails partway, M lets go and says why, so auto copy isn't left waiting on a sweep that never ends.
-	await evaluate(() => { goal_ctx.getImageData = () => { throw new Error("a test failure"); }; });
+	// If copying fails partway, M lets go and says why, so auto copy isn't left waiting on a sweep that never ends. M reads
+	// the canvas pixel it copies into, and the goal as the page last read it (task 7.3), so the canvas read fails here.
+	await evaluate(() => { main_ctx.getImageData = () => { throw new Error("a test failure"); }; });
 	await hover("goal", 200, 380);
 	await keyboard.press("m");
 	const failed_status = await status();
-	await evaluate(() => { delete goal_ctx.getImageData; });
+	await evaluate(() => { delete main_ctx.getImageData; });
 	check("M stops when copying fails, and says why", failed_status === "M stopped: a test failure", failed_status);
 	await keyboard.press("m", ["Shift"]); // resume
 	await sleep(600);
@@ -1066,7 +1068,7 @@ try {
 		};
 	}`;
 	await evaluate(REFUSE_NEW_KEYS);
-	const { identifier } = await page("Page.addScriptToEvaluateOnNewDocument", { source: REFUSE_NEW_KEYS });
+	const refuse_new_keys = await add_init_script(REFUSE_NEW_KEYS);
 	const in_full_game = () => evaluate(async (slot_data, items) => {
 		const { fake_session } = await import("/src/archipelago.js");
 		fake_session(slot_data, ["Magnifier", "Brush", ...items], "full-storage");
@@ -1074,6 +1076,7 @@ try {
 		const image = goal_ctx.createImageData(width, height); // the test's goal, which a reload doesn't keep
 		for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) image.data.set([(x * 3 + y) % 256, (y * 2 + 50) % 256, (x + y * 3) % 256, 255], (y * width + x) * 4);
 		goal_ctx.putImageData(image, 0, 0);
+		$G.triggerHandler("save-goal");
 		const { filler, level } = window.paint_hard_auto_copy.overclock_bank();
 		return { filler, level };
 	}, DEFAULT_BANK, [...DEFAULT_ITEMS, ...Array(10).fill("Overclock")]); // 20 s of fillers
@@ -1092,7 +1095,7 @@ try {
 		reloads.push({ left, after: after.filler, closing: Number(await evaluate(() => sessionStorage.getItem("test-closing-level"))), level: after.level, page: await overclock_id() });
 	}
 	const full_record = await overclock_stored("full-storage");
-	await page("Page.removeScriptToEvaluateOnNewDocument", { identifier });
+	await remove_init_script(refuse_new_keys);
 	check("with storage full, a tab that reloads keeps what it spent, twice, under the id it keeps", full_from.filler === 20 && reloads[0].left < 19 && reloads[1].left < reloads[0].left - 1 && reloads.every((r) => Math.abs(r.after - r.left) < 1e-9 && r.page === page_id) && full_record.pages === 0, `${full_from.filler} s of fillers; ${JSON.stringify(reloads.map(({ left, after, page }) => ({ left, after, page })))}; ${full_record.pages} keys stored for that game`);
 	check("...and the bank keeps the level it had as the page closed", reloads.every((r) => r.closing > 0.3 && Math.abs(r.level - r.closing) < 1e-6), JSON.stringify(reloads.map(({ closing, level }) => ({ closing, level }))));
 

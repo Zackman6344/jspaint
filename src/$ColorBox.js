@@ -173,6 +173,16 @@ function $ColorBox(vertical) {
 		$c.data("$last_fg_color_button", $palette.find(".color-button:first-child"));
 	};
 
+	// Rounds each palette button's stored color to today's shades again, as a Progressive Color Depth item changes them.
+	// Each button takes its color from the palette, since the color it holds is already rounded and would round twice.
+	// Only a button whose rounded color moved is redrawn: no rebuild, and nothing when no color moved.
+	const round_palette = (palette) => {
+		$palette.find(".color-button").each((i, button) => {
+			const color = palette[i];
+			if (typeof color === "string" && legalizeColor(color) !== $(button).data("swatch")) update_$swatch($(button), color);
+		});
+	};
+
 	let $c;
 	if (vertical) {
 		$c = $Component(localize("Colors"), "colors-component", "tall", $cb);
@@ -190,6 +200,7 @@ function $ColorBox(vertical) {
 	$c = /** @type {JQuery<HTMLDivElement> & I$Component & I$ColorBox} */ ($c);
 
 	$c.rebuild_palette = build_palette;
+	$c.round_palette = round_palette;
 
 	return $c;
 }

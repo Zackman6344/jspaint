@@ -7,8 +7,9 @@ import { $DialogWindow } from "./$ToolWindow.js";
 import { OnCanvasHelperLayer } from "./OnCanvasHelperLayer.js";
 import { OnCanvasSelection } from "./OnCanvasSelection.js";
 import { OnCanvasTextBox } from "./OnCanvasTextBox.js";
-import { deathlink, final_height, final_width, progression_rungs, received, send, slotData, version_below } from "./archipelago.js";
+import { deathlink, final_height, final_width, progression_rungs, received, send, session_name, slotData, update, version_below } from "./archipelago.js";
 import { miss_percent } from "./misses.js";
+import { formula_for, score_area, scored_area, similarity_of } from "./scoring.js";
 import { worst_error } from "./shades.js";
 // import { localize } from "./app-localization.js";
 import { default_palette } from "./color-data.js";
@@ -671,10 +672,12 @@ function paper_color() {
 function reset_canvas_and_history() {
 	undos.length = 0;
 	redos.length = 0;
+	const old_root = root_history_node;
 	current_history_node = root_history_node = make_history_node({
 		name: localize("New"),
 		icon: get_help_folder_icon("p_blank.png"),
 	});
+	release_steps(old_root); // the history that ends here keeps no canvas copy for whatever still points at one of its steps
 	history_node_to_cancel_to = null;
 
 	//main_canvas.width = Math.max(1, my_canvas_width);
@@ -988,15 +991,7 @@ function open_from_image_info(info, callback, canceled, into_existing_session, f
 	set_magnification(default_magnification);*/
 
 	if (from_session_load) {
-		createImageBitmap(info.image || info.image_data).then(function (e) {
-			main_ctx.drawImage(e, 0, 0, e.width, e.height)
-			current_history_node.name = localize("Open");
-			current_history_node.image_data = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
-			current_history_node.icon = get_help_folder_icon("p_open.png");
-			// Pain-T: upstream's own update, from the block below that no longer runs. A session loaded over this one
-			// changes the canvas, and auto copy hears about changes it didn't make through this, then rescores.
-			$G.triggerHandler("history-update");
-		});
+		return createImageBitmap(info.image || info.image_data).then(open_session_canvas);
 	}
 	else {
 		createImageBitmap(info.image || info.image_data).then(function (e) {
@@ -1036,6 +1031,33 @@ function open_from_image_info(info, callback, canceled, into_existing_session, f
 
 	callback?.();
 }, canceled, from_session_load);*/
+}
+
+/**
+ * Puts a session's canvas, restored from storage or loaded from a #load: URL, in place as the whole canvas. The canvas
+ * takes the image's size, on paper, before the image goes on (task 7.5): it used to keep the 800x600 it starts at, which
+ * cut a taller image at row 600. In a game the items then give the canvas its size, as a login does, and the canvas is
+ * scored, since item packets no longer rescore (task 7.2). A restore as the page opens waits for the login, which does
+ * both: with no slot data the logic figure would read NaN.
+ * @param {ImageBitmap} bitmap
+ */
+function open_session_canvas(bitmap) {
+	main_canvas.width = bitmap.width;
+	main_canvas.height = bitmap.height;
+	main_ctx.disable_image_smoothing();
+	if (!transparency) {
+		main_ctx.fillStyle = paper_color();
+		main_ctx.fillRect(0, 0, main_canvas.width, main_canvas.height);
+	}
+	main_ctx.drawImage(bitmap, 0, 0);
+	if (session_name() !== "offline") update(true);
+	current_history_node.name = localize("Open");
+	current_history_node.image_data = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
+	current_history_node.icon = get_help_folder_icon("p_open.png");
+	$canvas_area.trigger("resize");
+	// Pain-T: upstream's own update, from open_from_image_info's block that no longer runs. A session loaded over this one
+	// changes the canvas, and auto copy hears about changes it didn't make through this, then rescores.
+	$G.triggerHandler("history-update");
 }
 
 // Note: This function is part of the API.
@@ -1127,6 +1149,10 @@ function file_new() {
 	reset_file();
 	reset_selected_colors();
 	reset_canvas_and_history(); // (with newly reset colors)
+	// Pain-T: the blank canvas is a change to save, as a stroke is. No undo step comes with it, so while a game is loaded
+	// it is scored here: an item packet rescores only a canvas whose size changed (task 7.2).
+	$G.triggerHandler("session-update");
+	if (session_name() !== "offline") calculate_similarity();
 	deathlink("clear");
 	set_magnification(default_magnification);
 }
@@ -2135,51 +2161,100 @@ function go_to_history_node(target_history_node, canceling) {
 	$G.triggerHandler("history-update"); // update history view
 }
 
-function calculate_similarity() {
-	var s = 0;
-	// The version can't change mid-scan; asking for it at every pixel made a full rescore several times slower.
-	var before_0_2_0 = version_below("0.2.0"), before_0_5_0 = version_below("0.5.0");
-	var main_pixels = main_canvas.ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
-	var goal_pixels = goal_canvas.ctx.getImageData(0, 0, final_width, final_height);
-	var sim_pixels = sim_ctx.createImageData(final_width, final_height);
-	var diff_pixels = goal_pixels;
-	for (var x = 0; x < final_width; x++) {
-		for (var y = 0; y < final_height; y++) {
-			var goal_offset = (x + y * final_width) * 4;
-			if (x < main_canvas.width && y < main_canvas.height) {
-				var main_offset = (x + y * main_canvas.width) * 4;
-				var pixel_similarity = 0;
-				if (before_0_2_0) {
-					pixel_similarity = 1 - (Math.abs(main_pixels.data[main_offset] - goal_pixels.data[goal_offset]) +
-						Math.abs(main_pixels.data[main_offset + 1] - goal_pixels.data[goal_offset + 1]) +
-						Math.abs(main_pixels.data[main_offset + 2] - goal_pixels.data[goal_offset + 2])) / 765;
-				}
-				else {
-					pixel_similarity = 1 - Math.sqrt(((main_pixels.data[main_offset] - goal_pixels.data[goal_offset]) ** 2 +
-						(main_pixels.data[main_offset + 1] - goal_pixels.data[goal_offset + 1]) ** 2 +
-						(main_pixels.data[main_offset + 2] - goal_pixels.data[goal_offset + 2]) ** 2) / 3) / 255;
-				}
-				sim_pixels.data[goal_offset] = sim_pixels.data[goal_offset + 1] = sim_pixels.data[goal_offset + 2] = 255 * pixel_similarity;
-				sim_pixels.data[goal_offset + 3] = 255;
-				diff_pixels.data[goal_offset] = 128 + goal_pixels.data[goal_offset] - main_pixels.data[main_offset];
-				diff_pixels.data[goal_offset + 1] = 128 + goal_pixels.data[goal_offset + 1] - main_pixels.data[main_offset + 1];
-				diff_pixels.data[goal_offset + 2] = 128 + goal_pixels.data[goal_offset + 2] - main_pixels.data[main_offset + 2];
-				if (!before_0_5_0) pixel_similarity = 2 * pixel_similarity - 1;
-				s += pixel_similarity;
-			}
-			else {
-				if (before_0_5_0)
-					sim_pixels.data[goal_offset] = sim_pixels.data[goal_offset + 1] = sim_pixels.data[goal_offset + 2] = 0;
-				else
-					sim_pixels.data[goal_offset] = sim_pixels.data[goal_offset + 1] = sim_pixels.data[goal_offset + 2] = 128;
-			}
-		}
+// Which view shows over the goal: "similarity", "difference", or null for the goal itself. The four toggles set it
+// through toggle_view(), and update() hides a view whose item a session lacks. A rescore works out and draws only the
+// view that shows (task 7.1).
+let shown_view = null;
+
+/** Shows Similarity or Difference Mode over the goal, drawing it first, or with null the goal itself. */
+function show_view(view) {
+	shown_view = view;
+	if (view) calculate_similarity();
+	$sim.toggle(view === "similarity");
+	$diff.toggle(view === "difference");
+}
+
+/** What a toggle does: shows the view, or the goal again when the view already shows. */
+function toggle_view(view) {
+	show_view(shown_view === view ? null : view);
+}
+
+// The similarity the status bar shows, from the last rescore or auto copy's running total. An item packet moves the
+// logic figure after the slash without a rescore (task 7.2).
+let shown_similarity = 0;
+
+/** Shows a similarity in the status bar, or the last one shown, with logic's figure after the slash. */
+function show_similarity(similarity = shown_similarity) {
+	shown_similarity = similarity;
+	$status_similarity.text(similarity.toFixed(4) + "%/" + calculate_logic_similarity().toFixed(4) + "%");
+}
+
+/** The pixel formula for the seed loaded, or for a page with no seed (scoring.js). */
+function scoring_formula() {
+	return formula_for(version_below("0.2.0"), version_below("0.5.0"));
+}
+
+let rescores = 0; // every rescore, so a test can see an item packet make none (task 7.2)
+let scored_width = -1, scored_height = -1; // the canvas size the last rescore scored
+
+/** How many rescores the page has made, for tests. */
+function rescore_count() {
+	return rescores;
+}
+
+/** Whether the last rescore scored the canvas at the size it has now. */
+function scored_at_size() {
+	return main_canvas.width === scored_width && main_canvas.height === scored_height;
+}
+
+// The goal's pixels, read whole once for each goal and kept for every rescore, count of the pixels left, auto copy's
+// scan, M and Matched Pixels (7.10's shared read, built in task 7.3). Each rescore, count and press of M used to read
+// the goal again: 1.9 ms at 800x600 and 20 ms at 4000x3000 in Chrome 158. A goal drawn into the goal canvas comes with
+// save-goal, and archipelago.js's handler for it, the first bound, drops this read. So do a login into another game or
+// at another goal size, which starts the goal canvas over, and a goal canvas of another size.
+let goal_read = null;
+
+/** The goal's pixels, { data, width, height }, read whole when the goal is new. */
+function goal_pixels() {
+	if (!goal_read || goal_read.width !== goal_canvas.width || goal_read.height !== goal_canvas.height) {
+		goal_read = { width: goal_canvas.width, height: goal_canvas.height, data: goal_ctx.getImageData(0, 0, goal_canvas.width, goal_canvas.height).data };
 	}
-	sim_ctx.putImageData(sim_pixels, 0, 0);
-	diff_ctx.putImageData(diff_pixels, 0, 0);
-	s *= 100 / (final_width * final_height);
-	$status_similarity.text(s.toFixed(4) + "%/" + calculate_logic_similarity().toFixed(4) + "%");
-	return s;
+	return goal_read;
+}
+
+/** Forgets the goal's pixels as read, for a new goal. */
+function drop_goal_pixels() {
+	goal_read = null;
+}
+
+// Task 7.1. A rescore reads the canvas and the goal only over the area they share, from the top-left, and scores it row
+// by row through scoring.js. Outside that area the Similarity view is clear and the Difference view is the goal, as they
+// were when a rescore walked the goal's whole size: so a view is cleared, or the goal drawn into it, before the area goes
+// on top. The goal comes from the read every score shares (task 7.3), unless the area passes the goal canvas's edge. Only
+// a test's stand-in session makes that: it names a goal size and the goal canvas keeps its own, and the area past the goal
+// canvas scores against the transparent black a read there gives.
+function calculate_similarity() {
+	rescores++;
+	const formula = scoring_formula();
+	const [width, height] = scored_area(main_canvas.width, main_canvas.height, final_width, final_height);
+	const canvas = main_canvas.ctx.getImageData(0, 0, width, height).data;
+	const kept = width <= goal_canvas.width && height <= goal_canvas.height ? goal_pixels() : null;
+	const goal = kept ? kept.data : goal_canvas.ctx.getImageData(0, 0, width, height).data;
+	const view = shown_view === "similarity" ? sim_ctx.createImageData(width, height) : shown_view === "difference" ? diff_ctx.createImageData(width, height) : null;
+	const sum = score_area(formula, canvas, goal, width, height, shown_view === "similarity" ? view.data : null, shown_view === "difference" ? view.data : null, kept ? kept.width : width);
+	if (shown_view === "similarity") {
+		sim_ctx.clearRect(0, 0, sim_canvas.width, sim_canvas.height);
+		sim_ctx.putImageData(view, 0, 0);
+	} else if (shown_view === "difference") {
+		diff_ctx.clearRect(0, 0, diff_canvas.width, diff_canvas.height);
+		diff_ctx.drawImage(goal_canvas, 0, 0);
+		diff_ctx.putImageData(view, 0, 0);
+	}
+	scored_width = main_canvas.width;
+	scored_height = main_canvas.height;
+	const similarity = similarity_of(sum, final_width, final_height);
+	show_similarity(similarity);
+	return similarity;
 }
 
 // Logic's similarity ceiling as the world works it out (rules.py's percent_available(), D8): what auto copy gets right in
@@ -2205,6 +2280,104 @@ function calculate_logic_similarity() {
 	var copied = hours ? Math.min(area, 2 ** Math.min(progression_rungs("Progressive Auto Copy Speed"), slotData.auto_copy_speed_items ?? 10) * (1 - miss_percent(progression_rungs("Progressive Auto Copy Accuracy")) / 100) * hours * 3600) : 0;
 	var painted = hours ? Math.min(area, copied + start_w * start_h) : area;
 	return (full * copied + by_hand * (painted - copied)) * slotData.logic_percent / (final_width * final_height);
+}
+
+// Task 7.3: the undo history keeps at most 512 MiB of canvas copies, and never fewer than 2 steps on the way to the
+// current one, so Ctrl+Z always has a step to go back to. A step is 1.83 MiB at 800x600 and 45.8 MiB at 4000x3000, and
+// auto copy makes one a minute. A node's bytes are read off its images each time the budget is checked, so a step
+// updated in place or replaced by a session load counts at its size then; 7.10's tiles can count their patches in
+// node_bytes().
+const UNDO_BUDGET = 512 * 1024 * 1024;
+let undo_budget = UNDO_BUDGET;
+
+/** Sets the undo history's budget in bytes, for tests: with none, back to 512 MiB. */
+function set_undo_budget(bytes) {
+	undo_budget = bytes ?? UNDO_BUDGET;
+}
+
+/** The bytes a history node keeps: its canvas copy and its selection's. */
+function node_bytes(node) {
+	return (node.image_data?.data.byteLength ?? 0) + (node.selection_image_data?.data.byteLength ?? 0);
+}
+
+/** The bytes a history node and every step after it keep, on every branch. */
+function branch_bytes(node) {
+	let bytes = 0;
+	for (const stack = [node]; stack.length;) {
+		const next = stack.pop();
+		bytes += node_bytes(next);
+		stack.push(...next.futures);
+	}
+	return bytes;
+}
+
+/** The bytes the whole undo history keeps. */
+function history_bytes() {
+	return branch_bytes(root_history_node);
+}
+
+// After each new step, the oldest steps go while the history keeps more than its budget and more than 2 steps are left on
+// the way to the current one. The oldest step kept becomes the root, with no parent, and the branches off the steps that
+// went go with them. Undo lets go of them, release_steps() takes their canvas copies and their links, and the History
+// window shows the steps kept at the history-update the new step makes. Redo holds only steps after the current one.
+// Esc's cancel point is the current step or one before it, since every move through the history clears it, and it stays:
+// a gesture that makes steps of its own, as the Select tool can, rolls back to it. `redo_step` is the step Redo led to
+// before the new step emptied it, if there was one.
+function trim_history(redo_step) {
+	let bytes = history_bytes();
+	if (bytes <= undo_budget) return;
+	const way = [...get_history_ancestors(current_history_node).reverse(), current_history_node];
+	const cancel_at = history_node_to_cancel_to ? way.indexOf(history_node_to_cancel_to) : -1;
+	const last = cancel_at >= 0 ? Math.min(cancel_at, way.length - 2) : way.length - 2; // the oldest step that may become the root
+	let cut = 0;
+	while (bytes > undo_budget && cut < last) {
+		const step = way[cut], next = way[cut + 1];
+		bytes -= node_bytes(step);
+		for (const branch of step.futures) if (branch !== next) bytes -= branch_bytes(branch);
+		cut++;
+	}
+	if (cut) {
+		const gone = new Set(way.slice(0, cut));
+		root_history_node = way[cut];
+		for (let i = 0; i < cut; i++) release_steps(way[i], way[i + 1]);
+		root_history_node.parent = null;
+		undos = undos.filter((node) => !gone.has(node));
+	}
+	// The cut stops at the way's 2 newest steps or at the cancel point. If the history is still over its budget there,
+	// the branches off the steps kept go, oldest first, until it fits. A branch is what Undo or Esc stepped back from
+	// before another step was made: 12 tries at one stroke leave 12 of them on one step. Redo is empty after a new step
+	// and the cancel point is on the way, so only the History window reaches a branch. One branch stays through this trim,
+	// over the budget or not: the one that starts at `redo_step`. With the history at its budget, a click on the History
+	// window's first entry and one step from there, which auto copy makes 3 s after the click, leave the line the page
+	// stepped back from listed. From the next step on it goes as any branch does: with its step, or oldest first.
+	if (bytes <= undo_budget) return;
+	const kept = way.slice(cut), branches = [];
+	kept.forEach((step, i) => {
+		for (const branch of step.futures) if (branch !== kept[i + 1] && branch !== redo_step) branches.push({ step, branch });
+	});
+	branches.sort((a, b) => a.branch.timestamp - b.branch.timestamp);
+	for (const { step, branch } of branches) {
+		if (bytes <= undo_budget) break;
+		bytes -= branch_bytes(branch);
+		step.futures.splice(step.futures.indexOf(branch), 1);
+		release_steps(branch);
+	}
+}
+
+// A step that leaves the history lets go of its canvas copy, its selection's, its parent and the steps after it, and so
+// does every step after it on every branch, but for `keep` and what follows it. Auto copy points at its own step and at
+// the step it last saw (auto-copy.js), and a History window that hasn't been redrawn has an entry for each step it
+// listed. With the links cut, what they hold is a few hundred bytes and no way back into the history: go_to_history_node()
+// says such a step has no image data.
+function release_steps(from, keep = null) {
+	for (const stack = [from]; stack.length;) {
+		const node = stack.pop();
+		if (node === keep) continue;
+		stack.push(...node.futures);
+		node.image_data = node.selection_image_data = null;
+		node.parent = null;
+		node.futures = [];
+	}
 }
 
 // Note: This function is part of the API.
@@ -2238,6 +2411,7 @@ function undoable({ name, icon, use_loose_canvas_changes, soft, assume_saved }, 
 
 	const image_data = main_ctx.getImageData(0, 0, main_canvas.width, main_canvas.height);
 
+	const redo_step = redos[redos.length - 1]; // Pain-T: where Redo leads, read before Redo is emptied, for trim_history()
 	redos.length = 0;
 	undos.push(current_history_node);
 
@@ -2263,6 +2437,7 @@ function undoable({ name, icon, use_loose_canvas_changes, soft, assume_saved }, 
 	});
 	current_history_node.futures.push(new_history_node);
 	current_history_node = new_history_node;
+	trim_history(redo_step); // before the send, which throws while disconnected
 	send(calculate_similarity());
 
 	$G.triggerHandler("history-update"); // update history view
@@ -2534,10 +2709,11 @@ function cancel(going_to_history_node, discard_document_state) {
 		selected_tool.cancel?.();
 	}
 	if (!going_to_history_node) {
-		// Note: this will revert any changes from other users in multi-user sessions
-		// which isn't good, but there's no real conflict resolution in multi-user mode anyways
-		go_to_history_node(history_node_to_cancel_to, true);
-
+		// Pain-T: a discarded step leaves its parent before the page goes back, so go_to_history_node() lists Redo and
+		// redraws the History window without it. Redo follows the way to the discarded step as far as its parent, then
+		// the oldest branch of each step. After a press with Fill, whose one step hangs off the cancel point, that is the
+		// line Redo led to before the press, unless an older try branches off the cancel point or that line. The next
+		// step's trim spares the branch Redo leads to (trim_history()).
 		if (history_node_to_discard) {
 			const index = history_node_to_discard.parent.futures.indexOf(history_node_to_discard);
 			if (index === -1) {
@@ -2547,10 +2723,11 @@ function cancel(going_to_history_node, discard_document_state) {
 				console.log("history_node_to_discard.parent", history_node_to_discard.parent);
 			} else {
 				history_node_to_discard.parent.futures.splice(index, 1);
-				$G.triggerHandler("history-update"); // update history view (don't want you to be able to click on the excised node)
-				// (@TODO: prevent duplicate update, here vs go_to_history_node)
 			}
 		}
+		// Note: this will revert any changes from other users in multi-user sessions
+		// which isn't good, but there's no real conflict resolution in multi-user mode anyways
+		go_to_history_node(history_node_to_cancel_to, true);
 	}
 	history_node_to_cancel_to = null;
 	update_helper_layer();
@@ -3263,6 +3440,10 @@ function resize_canvas_without_saving_dimensions(unclamped_width, unclamped_heig
  */
 function resize_canvas_and_save_dimensions(unclamped_width, unclamped_height, undoable_meta = {}) {
 	resize_canvas_without_saving_dimensions(unclamped_width, unclamped_height, undoable_meta);
+	// Pain-T: no undo step comes with the resize, so while a game is loaded the canvas is scored here, at its new size.
+	// The next item packet puts the canvas back at the size the items give, and rescores a canvas whose size changed
+	// (task 7.2).
+	if (session_name() !== "offline") calculate_similarity();
 	localStore.set({
 		width: main_canvas.width.toString(),
 		height: main_canvas.height.toString(),
@@ -4320,9 +4501,9 @@ export {
 	$this_version_news,
 	apply_file_format_and_palette_info, are_you_sure, calculate_logic_similarity, calculate_similarity, cancel, change_some_url_params, change_url_param, choose_file_to_paste, cleanup_bitmap_view, clear, confirm_overwrite_capability, delete_selection, deselect, detect_monochrome,
 	edit_copy, edit_cut, edit_paste, exit_fullscreen_if_ios, file_load_from_url, file_new, file_open, file_print, file_save,
-	file_save_as, getSelectionText, get_all_url_params, get_history_ancestors, get_tool_by_id, get_uris, get_url_param, go_to_history_node, handle_keyshortcuts, has_any_transparency, image_attributes, image_flip_and_rotate, image_invert_colors, image_stretch_and_skew, load_image_from_uri, load_theme_from_text, make_history_node, make_monochrome_palette, make_monochrome_pattern, make_opaque, make_or_update_undoable, make_stripe_pattern, meld_selection_into_canvas,
-	meld_textbox_into_canvas, open_from_file, open_from_image_info, paste, paste_image_from_file, please_enter_a_number, read_image_file, redo, render_canvas_view, render_history_as_gif, reset_canvas_and_history, reset_file, reset_selected_colors, resize_canvas_and_save_dimensions, resize_canvas_without_saving_dimensions, sanity_check_blob, save_as_prompt, save_selection_to_file, select_all, select_tool, select_tools, set_all_url_params, set_magnification, show_about_paint, show_convert_to_black_and_white, show_custom_zoom_window, show_document_history, show_error_message, show_file_format_errors, show_multi_user_setup_dialog, show_news, show_resource_load_error_message, switch_to_polychrome_palette, toggle_grid,
-	toggle_thumbnail, try_exec_command, undo, undoable, update_canvas_rect, update_css_classes_for_conditional_messages, update_disable_aa, update_from_saved_file, update_helper_layer,
+	drop_goal_pixels, file_save_as, getSelectionText, get_all_url_params, get_history_ancestors, get_tool_by_id, get_uris, get_url_param, goal_pixels, go_to_history_node, handle_keyshortcuts, has_any_transparency, history_bytes, image_attributes, image_flip_and_rotate, image_invert_colors, image_stretch_and_skew, load_image_from_uri, load_theme_from_text, make_history_node, make_monochrome_palette, make_monochrome_pattern, make_opaque, make_or_update_undoable, make_stripe_pattern, meld_selection_into_canvas,
+	meld_textbox_into_canvas, open_from_file, open_from_image_info, open_session_canvas, paste, paste_image_from_file, please_enter_a_number, read_image_file, redo, render_canvas_view, render_history_as_gif, rescore_count, reset_canvas_and_history, reset_file, reset_selected_colors, resize_canvas_and_save_dimensions, resize_canvas_without_saving_dimensions, sanity_check_blob, save_as_prompt, save_selection_to_file, scored_at_size, scoring_formula, select_all, select_tool, select_tools, set_all_url_params, set_magnification, set_undo_budget, show_about_paint, show_convert_to_black_and_white, show_custom_zoom_window, show_document_history, show_error_message, show_file_format_errors, show_multi_user_setup_dialog, show_news, show_resource_load_error_message, show_similarity, show_view, shown_view, switch_to_polychrome_palette, toggle_grid,
+	toggle_thumbnail, toggle_view, try_exec_command, undo, undoable, update_canvas_rect, update_css_classes_for_conditional_messages, update_disable_aa, update_from_saved_file, update_helper_layer,
 	update_helper_layer_immediately, update_magnified_canvas_size, update_title, view_bitmap, write_image_file
 };
 // Temporary globals until all dependent code is converted to ES Modules

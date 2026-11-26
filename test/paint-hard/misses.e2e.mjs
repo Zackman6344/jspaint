@@ -27,18 +27,21 @@ const game = (items, slot = SLOT, size = SIDE, name = "test") => evaluate(async 
 	fake_session(slot, ["Magnifier", "Brush", ...items], name);
 	if (main_canvas.width !== size || main_canvas.height !== size) resize_canvas_without_saving_dimensions(size, size);
 }, slot, items, size, name);
-// The goal auto-copy.e2e.mjs draws: no pixel is white.
+// The goal auto-copy.e2e.mjs draws: no pixel is white. Each goal drawn comes with save-goal, as a goal the page draws
+// does, so the page reads it again (task 7.3).
 const standard_goal = () => evaluate(() => {
 	const { width, height } = goal_canvas;
 	const image = goal_ctx.createImageData(width, height);
 	for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) image.data.set([(x * 3 + y) % 256, (y * 2 + 50) % 256, (x + y * 3) % 256, 255], (y * width + x) * 4);
 	goal_ctx.putImageData(image, 0, 0);
+	$G.triggerHandler("save-goal");
 });
 // A goal in bands of rows across the top left: [[the row a band ends before, its color], ...].
 const banded_goal = (bands, side = SIDE) => evaluate((bands, side) => {
 	const image = goal_ctx.getImageData(0, 0, side, side);
 	for (let y = 0; y < side; y++) for (let x = 0; x < side; x++) image.data.set(bands.find(([until]) => y < until)[1], (y * side + x) * 4);
 	goal_ctx.putImageData(image, 0, 0);
+	$G.triggerHandler("save-goal");
 }, bands, side);
 const whiten = () => evaluate(() => { main_ctx.fillStyle = "#fff"; main_ctx.fillRect(0, 0, main_canvas.width, main_canvas.height); });
 const hook = (name, ...args) => evaluate((name, args) => window.paint_hard_auto_copy[name](...args), name, args);
@@ -234,10 +237,11 @@ try {
 		window.__goal_px = goal_ctx.getImageData(12, 12, 1, 1);
 		const gray = new ImageData(Uint8ClampedArray.from([128, 128, 128, 255]), 1, 1);
 		goal_ctx.putImageData(gray, 12, 12);
+		$G.triggerHandler("save-goal");
 		main_ctx.putImageData(gray, 12, 12);
 	});
 	const kept_status = await press_m(12, 12), kept_after = await canvas_px(12, 12);
-	await evaluate(() => goal_ctx.putImageData(window.__goal_px, 12, 12));
+	await evaluate(() => { goal_ctx.putImageData(window.__goal_px, 12, 12); $G.triggerHandler("save-goal"); });
 	check("M repaints a pixel one level off at full depth, and leaves a 3-shade 128 that no 4-shade color beats", one_off_after.slice(0, 3).join() === one_off_goal.slice(0, 3).join() && one_off_status === "Copied 10,10 from the goal." && kept_after.slice(0, 3).join() === "128,128,128" && kept_status === "Already matches the goal.", `goal ${one_off_goal.slice(0, 3)}, after M ${one_off_after.slice(0, 3)}: "${one_off_status}"; the 128 pixel after M ${kept_after.slice(0, 3)}: "${kept_status}"`);
 
 	// The running total stays a full rescore's, with misses, while a pass runs at 1,024 pixels a second. Between counts of
