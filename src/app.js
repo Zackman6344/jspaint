@@ -10,6 +10,7 @@ import { Handles } from "./Handles.js";
 // import { get_direction, localize } from "./app-localization.js";
 import { default_palette, get_winter_palette } from "./color-data.js";
 import { image_formats } from "./file-format-data.js";
+import { goal_locked, show_goal_window } from "./goal.js";
 import { $this_version_news, cancel, change_url_param, clear, confirm_overwrite_capability, delete_selection, deselect, edit_copy, edit_cut, edit_paste, file_new, file_save, file_save_as, get_tool_by_id, get_uris, image_attributes, image_flip_and_rotate, image_invert_colors, load_image_from_uri, make_or_update_undoable, open_from_file, paste, paste_image_from_file, redo, render_history_as_gif, reset_canvas_and_history, reset_file, reset_selected_colors, resize_canvas_and_save_dimensions, resize_canvas_without_saving_dimensions, save_as_prompt, select_all, select_tool, select_tools, set_magnification, show_document_history, show_error_message, show_news, show_resource_load_error_message, toggle_grid, toggle_view, undo, update_canvas_rect, update_disable_aa, update_helper_layer, update_magnified_canvas_size, view_bitmap, write_image_file } from "./functions.js";
 import { show_help } from "./help.js";
 import { $G, E, TAU, get_file_extension, get_help_folder_icon, is_discord_embed, make_canvas, to_canvas_coords } from "./helpers.js";
@@ -429,6 +430,9 @@ window.canvas_handles = canvas_handles;
 const $goal = $(goal_canvas).css("left", "810px").appendTo($canvas_area);
 var $goal_image = new Image();
 $goal_image.onload = function () {
+	// A seed from version 1.2.0 on locks its goal, which goal.js draws (task 7.8): an image that loads meanwhile, as a
+	// restored session's goal, draws nothing.
+	if (goal_locked()) return;
 	// A reconnect into the same game keeps the goal it holds until this draw (archipelago.js), so the draw starts from a
 	// clear canvas itself: a goal with alpha would blend over its own last draw.
 	goal_ctx.clearRect(0, 0, goal_canvas.width, goal_canvas.height);
@@ -473,6 +477,9 @@ const $status_size = $(E("div")).addClass("status-coordinates status-field inset
 window.$status_size = $status_size;
 const $status_similarity = $(E("div")).addClass("status-coordinates status-field inset-shallow").appendTo($status_area);
 window.$status_similarity = $status_similarity;
+// Task 7.8: while the field says the seed's goal is loading or missing, a click on it shows the Goal Image window again,
+// with its Cancel or Retry, after the player closed it.
+$status_similarity.on("click", () => show_goal_window());
 
 // #region News Indicator
 const news_seen_key = "jspaint latest news seen";

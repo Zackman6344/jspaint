@@ -7,7 +7,8 @@ import { $DialogWindow } from "./$ToolWindow.js";
 import { OnCanvasHelperLayer } from "./OnCanvasHelperLayer.js";
 import { OnCanvasSelection } from "./OnCanvasSelection.js";
 import { OnCanvasTextBox } from "./OnCanvasTextBox.js";
-import { deathlink, final_height, final_width, progression_rungs, received, send, session_name, slotData, update, version_below } from "./archipelago.js";
+import { deathlink, final_height, final_width, progression_rungs, received, send, session_name, slotData, unlocked_size, update, version_below } from "./archipelago.js";
+import { goal_locked, goal_ready, goal_status_text, offer_goal_file } from "./goal.js";
 import { miss_percent } from "./misses.js";
 import { formula_for, score_area, scored_area, similarity_of } from "./scoring.js";
 import { worst_error } from "./shades.js";
@@ -1078,6 +1079,12 @@ function open_from_file(file, source_file_handle) {
 		file.text().then(load_theme_from_text, (error) => {
 			show_error_message(localize("Paint cannot open this file."), error);
 		});
+		return;
+	}
+	// Pain-T, task 7.8: a seed from version 1.2.0 on locks its goal (D18). File > Open Goal Image, a dropped image and
+	// Electron's open-file take a file in its place only when its SHA-256 is the seed's, through goal.js.
+	if (goal_locked()) {
+		offer_goal_file(file);
 		return;
 	}
 	// Try loading as an image file first, then as a palette file, but show a combined error message if both fail.
@@ -2183,10 +2190,13 @@ function toggle_view(view) {
 // logic figure after the slash without a rescore (task 7.2).
 let shown_similarity = 0;
 
-/** Shows a similarity in the status bar, or the last one shown, with logic's figure after the slash. */
+/**
+ * Shows a similarity in the status bar, or the last one shown, with logic's figure after the slash. While the seed's goal
+ * isn't drawn, the field says so instead (task 7.8).
+ */
 function show_similarity(similarity = shown_similarity) {
 	shown_similarity = similarity;
-	$status_similarity.text(similarity.toFixed(4) + "%/" + calculate_logic_similarity().toFixed(4) + "%");
+	$status_similarity.text(goal_status_text() ?? similarity.toFixed(4) + "%/" + calculate_logic_similarity().toFixed(4) + "%");
 }
 
 /** The pixel formula for the seed loaded, or for a page with no seed (scoring.js). */
@@ -2234,6 +2244,12 @@ function drop_goal_pixels() {
 // a test's stand-in session makes that: it names a goal size and the goal canvas keeps its own, and the area past the goal
 // canvas scores against the transparent black a read there gives.
 function calculate_similarity() {
+	// Task 7.8: while the seed's goal isn't drawn there is nothing to score against. The status bar says the goal is
+	// loading, sends are held (archipelago.js), and the goal's draw rescores.
+	if (!goal_ready()) {
+		show_similarity(0);
+		return 0;
+	}
 	rescores++;
 	const formula = scoring_formula();
 	const [width, height] = scored_area(main_canvas.width, main_canvas.height, final_width, final_height);
@@ -2918,6 +2934,10 @@ function edit_cut(execCommandFallback) {
  * @param {boolean} [execCommandFallback]
  */
 async function edit_paste(execCommandFallback) {
+	// Pain-T: Paste is switched off, as Edit > Paste, Paste From and the paste event are (menus.js, app.js). Shift+Insert
+	// was the one way left to it. A text field takes the key itself, before app.js's handler reaches this.
+	return;
+	// eslint-disable-next-line no-unreachable
 	if (
 		document.activeElement instanceof HTMLInputElement ||
 		document.activeElement instanceof HTMLTextAreaElement
@@ -3402,7 +3422,10 @@ function resize_canvas_without_saving_dimensions(unclamped_width, unclamped_heig
 			icon: undoable_meta.icon || get_help_folder_icon("p_stretch_both.png"),
 		}, () => {*/
 		try {
-			const image_data = main_ctx.getImageData(0, 0, new_width, new_height);
+			// Pain-T: the canvas as it was, copied by drawing it onto a canvas of its own. A browser that blocks canvas
+			// reads, as Firefox's resistFingerprinting does, answers a read with random bytes, and a read here would draw
+			// them back onto the canvas at every login and canvas item.
+			const temp_canvas = make_canvas(main_canvas);
 			main_canvas.width = new_width;
 			main_canvas.height = new_height;
 			main_ctx.disable_image_smoothing();
@@ -3412,7 +3435,6 @@ function resize_canvas_without_saving_dimensions(unclamped_width, unclamped_heig
 				main_ctx.fillRect(0, 0, main_canvas.width, main_canvas.height);
 			}
 
-			const temp_canvas = make_canvas(image_data);
 			main_ctx.drawImage(temp_canvas, 0, 0);
 		} catch (exception) {
 			if (exception.name === "NS_ERROR_FAILURE") {
@@ -3601,8 +3623,9 @@ function image_attributes() {
 
 	// Parsing HTML with jQuery; $Button takes text (not HTML) or Node/DocumentFragment
 	$w.$Button($.parseHTML(render_access_key(localize("&Default")))[0], () => {
-		width_in_px = default_canvas_width;
-		height_in_px = default_canvas_height;
+		// Pain-T: while a game is loaded the default is the size the items give. 800x600 there let OK grow the canvas
+		// past what the items unlock, and the page sent checks for what was painted there until the next item packet.
+		[width_in_px, height_in_px] = session_name() !== "offline" ? unlocked_size() : [default_canvas_width, default_canvas_height];
 		$width.val(width_in_px / unit_sizes_in_px[current_unit]);
 		$height.val(height_in_px / unit_sizes_in_px[current_unit]);
 	}).attr("aria-keyshortcuts", "Alt+D D");

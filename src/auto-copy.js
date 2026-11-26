@@ -13,7 +13,8 @@
 import { calculate_similarity, deselect, goal_pixels, scoring_formula, show_similarity, shown_view, undoable, update_helper_layer } from "./functions.js";
 import { $G, get_icon_for_tool, get_rgba_from_color } from "./helpers.js";
 import { legalizeColor } from "./$ColorBox.js";
-import { final_height, final_width, game_changed, rungs, send, session_name, slotData } from "./archipelago.js";
+import { final_height, final_width, game_changed, rungs, send, session_name, slotData, watch_reads } from "./archipelago.js";
+import { goal_ready } from "./goal.js";
 import { draws, land_chance, margin_ranges, miss_margin, miss_percent, miss_value, rolls_miss, seeded } from "./misses.js";
 import { pixel_score } from "./scoring.js";
 import { quantize } from "./shades.js";
@@ -39,10 +40,20 @@ const in_bounds = (element, { x, y }) => x >= 0 && y >= 0 && x < element.width &
 // Browsers that blur canvas reads against fingerprinting (Brave, Firefox's strict mode) can read a color back a step
 // off. The page checks for that as it loads, and again whenever a pixel auto copy or M just wrote reads back different
 // (D7). Only then may each channel be 1 off when a pixel is judged. Reads further off than that can't judge pixels, and
-// count as blocked until a later probe reads clean (reads_are_blocked()).
+// count as blocked until a later probe reads clean (reads_are_blocked()). From the first block to the page's end the
+// canvas counts as tainted (canvas_tainted()).
 let read_noise = null; // where noise was found: "load" or "read-back", or null for none
 let reads_blocked = false;
+let blocked_once = false;
 const BLOCKED = "Your browser blocks reading the canvas, which auto copy and M need. Allow canvas reads for this site.";
+// Once reads come clean after a block, auto copy and M wait for a reload, as saves and sends do.
+const RELOAD_TO_COPY = "Now that canvas reads are allowed, reload this tab to use auto copy and M.";
+const tainted_message = () => (reads_blocked ? BLOCKED : RELOAD_TO_COPY);
+// Reads found more than a step off: blocked for now, and the canvas tainted for the rest of the page.
+function block_reads() {
+	reads_blocked = true;
+	blocked_once = true;
+}
 const takes_text = (element) => element instanceof HTMLElement && (element.isContentEditable || element.matches("textarea, select, input:not([type=range], [type=button], [type=checkbox], [type=radio])"));
 const count_of = rungs;
 
@@ -692,8 +703,9 @@ function queue(pixel) {
 }
 
 function start_sweep(code) {
+	if (!goal_ready()) return show_status("M can't copy until the goal image has loaded."); // task 7.8
 	if (busy()) return show_status("Let go of the mouse first.");
-	if (reads_are_blocked()) return show_status(BLOCKED); // probes again, for a player who has allowed reads since
+	if (canvas_tainted()) return show_status(tainted_message()); // probes, for reads blocked or allowed since the last ask
 	if (sweep) end_sweep(true);
 	// filled_at starts where the allowance last filled, so time nothing was copying still counts, up to a second.
 	sweep = { ...new_progress(250, 500), code, last: null, pending: [], count: 0, missed: 0, first: null, seen: false, outside: false, skipped: 0, frame: 0, timer: 0, released: false, filled_at: (alongside() ? m_allowance : allowance).at };
@@ -744,6 +756,7 @@ function flush_sweep() {
 
 // Copies the pixels in line while the allowance has them and this frame has time. Returns whether time ran out first.
 function copy_pending() {
+	if (blocked_once) throw new Error(tainted_message()); // a save or a send since the last flush found the reads blocked
 	const now = performance.now();
 	// Alongside a running auto copy, M copies from its own allowance into auto copy's undo step: a step of its own would
 	// make the two take turns making a new step every few milliseconds.
@@ -894,7 +907,7 @@ function check_read_back() {
 	const { x, y, r, g, b } = last_write;
 	const back = main_ctx.getImageData(x, y, 1, 1).data;
 	const off = Math.max(Math.abs(back[0] - r), Math.abs(back[1] - g), Math.abs(back[2] - b));
-	if (off > 1) reads_blocked = true;
+	if (off > 1) block_reads();
 	else if (off === 1) read_noise = "read-back";
 	last_write = null;
 }
@@ -925,7 +938,7 @@ function probe_reads() {
 	if (probed) return;
 	probed = true;
 	const off = probe_off();
-	if (off > 1) reads_blocked = true;
+	if (off > 1) block_reads();
 	else if (off === 1) read_noise = "load";
 }
 
@@ -977,6 +990,7 @@ const SWEEPS = {
 
 // Why auto copy should hold off right now, or "" to carry on.
 function waiting_reason(now) {
+	if (!goal_ready()) return "Waiting for the goal image."; // task 7.8: the seed's goal isn't drawn yet
 	if (disconnected()) return "Waiting for the connection.";
 	if (busy() || selection || textbox) return "Waiting while you draw or select.";
 	if (sweep && !together()) return "Waiting while you hold M.";
@@ -998,6 +1012,8 @@ function auto_tick() {
 		}
 		if (main_canvas.width !== scores.width || main_canvas.height !== scores.height) scores.valid = false;
 		if (!busy()) catch_up(auto);
+		// A save or a send found the reads blocked since the last tick: stop before painting or spending Overclock.
+		if (blocked_once) throw new Error(tainted_message());
 		auto.waiting = waiting_reason(now);
 		if (auto.waiting) return update_panel();
 		history_node_to_cancel_to = null; // see settle()
@@ -1107,7 +1123,7 @@ function auto_tick() {
 // past the trap that reopened pixels.
 function start_auto(by_loop = false) {
 	if (auto?.running) return;
-	if (reads_are_blocked()) return update_panel(BLOCKED);
+	if (canvas_tainted()) return update_panel(tainted_message()); // probes, for reads blocked or allowed since the last ask
 	let left;
 	try {
 		left = count_left();
@@ -1457,11 +1473,11 @@ settle_page();
 if (document.readyState === "complete") init();
 else addEventListener("load", init);
 
-// Whether this browser blocks canvas reads, as the load's probe or a read back found. Autosave asks before each save
-// (task 7.4): a blocked browser's PNG comes out blank, and would overwrite the session's record. Asked before the page has
-// loaded, it probes then. The player can allow canvas reads while the page is open, as Firefox's canvas permission does
-// without a reload, so while reads count as blocked each ask probes again, and a probe that reads clean or a step off
-// ends the block for saves, auto copy and M.
+// Whether this browser blocks canvas reads now, as the load's probe, a later one (canvas_tainted()) or a read back
+// found. Asked before the page has loaded, it probes then. The player can allow canvas reads while the page is open, as
+// Firefox's canvas permission does without a reload, so while reads count as blocked each ask probes again, and a probe
+// that reads clean or a step off ends the block and fires canvas-reads-allowed: the goal as read while reads were
+// blocked goes (archipelago.js), and the page says once that a reload sends checks and saves again (sessions.js).
 function reads_are_blocked() {
 	probe_reads();
 	if (reads_blocked) {
@@ -1469,10 +1485,24 @@ function reads_are_blocked() {
 		if (off <= 1) {
 			reads_blocked = false;
 			if (off === 1 && !read_noise) read_noise = "load";
+			$G.triggerHandler("canvas-reads-allowed");
 		}
 	}
 	return reads_blocked;
 }
+
+// Whether canvas reads count as blocked now, or did at any point since the page loaded. While the page counts as clean,
+// each ask probes too, so reads blocked with the page open, as a canvas permission taken back or a blocking extension
+// switched on blocks them, count from the next ask; while it counts as tainted, it probes as reads_are_blocked() does.
+// A blocked read gives the browser's own answer, random bytes under Firefox's resistFingerprinting, and wherever the
+// page reads the canvas and draws the read back, as an undo and an Undo Trap do, that answer goes onto the canvas and
+// stays there once reads are allowed. So archipelago.js asks this before a send, sessions.js before a save or an Export
+// Session, and auto copy and M before they start, and each waits for a reload, which restores the session's last save.
+function canvas_tainted() {
+	if (!blocked_once && probe_off() > 1) block_reads();
+	return reads_are_blocked() || blocked_once;
+}
+watch_reads(canvas_tainted);
 
 // Whether auto copy or M has painted pixels since it last asked Paint to save, which catch_up() does at most every 5 s.
 // A session counts them as a change when it saves as the page goes, as it ends, as the tab leaves it for another game,
@@ -1481,4 +1511,4 @@ function copies_unsaved() {
 	return !!(auto?.unsaved || sweep?.unsaved);
 }
 
-export { copies_unsaved, reads_are_blocked, show_auto_copy_panel };
+export { canvas_tainted, copies_unsaved, reads_are_blocked, show_auto_copy_panel };

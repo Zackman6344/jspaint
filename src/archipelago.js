@@ -1,5 +1,6 @@
 import { Client } from "../lib/archipelago.min.js";
 import { calculate_similarity, clear, drop_goal_pixels, goal_pixels, image_invert_colors, reset_canvas_and_history, resize_canvas_without_saving_dimensions, scored_at_size, select_tool, set_magnification, show_similarity, show_view, shown_view, undo } from "./functions.js";
+import { goal_ready, release_seed_goal, seed_goal_of, take_seed_goal } from "./goal.js";
 import { show_help } from "./help.js";
 import { $G } from "./helpers.js";
 import { request_of, transact } from "./idb.js";
@@ -195,7 +196,8 @@ var $ap_connect = $("<button>Connect!</button>").on("click", function () {
 			// the goal and the read of it alone: the goal image draws over it again at its load. Cleared here, the goal was
 			// blank until then, and a tick of auto copy in between copied from the blank read and could send every check.
 			const game = `${loaded.seed}-${loaded.team}-${loaded.slot}`;
-			if (game !== goal_game || goal_canvas.width !== final_width || goal_canvas.height !== final_height) {
+			const cleared = game !== goal_game || goal_canvas.width !== final_width || goal_canvas.height !== final_height;
+			if (cleared) {
 				goal_canvas.width = final_width;
 				goal_canvas.height = final_height;
 				// Blank until the goal image draws, at any size: a read of the last game's goal would score this game's
@@ -213,7 +215,16 @@ var $ap_connect = $("<button>Connect!</button>").on("click", function () {
 			sim_canvas.height = final_height;
 			$sim.width(final_width)
 			$sim.height(final_height)
-			$goal_image.attr("src", $goal_image.attr("src") ?? ("images/archipelago/" + final_width + "x" + final_height + ".png"));
+			// Task 7.8: from version 1.2.0 a seed names its goal, the bundled image or the player's own, and goal.js loads it
+			// once for each seed, team, slot, reference, hash and size, and holds the checks until it is drawn. Older seeds
+			// draw the bundled image of their size, or the goal a restored session brought.
+			const seed_goal = seed_goal_of(slotData.goal_image, slotData.goal_image_sha256, loaded, final_width, final_height, version_below("1.2.0"));
+			if (seed_goal) {
+				take_seed_goal(seed_goal, cleared);
+			} else {
+				release_seed_goal();
+				$goal_image.attr("src", $goal_image.attr("src") ?? ("images/archipelago/" + final_width + "x" + final_height + ".png"));
+			}
 			$G.triggerHandler("save-connection-info");
 			$G.triggerHandler("restore-colors");
 			// Every tool starts locked, as on a fresh page, so a tool the last game unlocked shows only if this one has it.
@@ -284,7 +295,29 @@ function count_matched(limit) {
 	return count;
 }
 
+// Task 7.8 (D18): while the seed's goal isn't drawn, send() sends nothing, and returns without throwing, since undoable()
+// calls it with no guard. The goal's draw scores the canvas, and that score goes out then, once, if a send was held.
+var send_held = false;
+// So it does once the browser has blocked canvas reads, at the load or with the page open, for the rest of the page: a
+// blocked read gives the browser's own answer, random bytes under Firefox's resistFingerprinting, which an undo or an
+// Undo Trap draws onto the canvas, where it stays once reads are allowed, and a score of that sends checks the canvas
+// hasn't earned. A reload restores the session's last save, and checks go out from there. auto-copy.js, which probes
+// the reads at each send, hands its test to this module as it loads (watch_reads(), canvas_tainted()): it imports this
+// module, which can't import it.
+var canvas_tainted;
+function watch_reads(test) {
+	canvas_tainted = test;
+}
 function send(similarity) {
+	if (!goal_ready()) {
+		send_held = true;
+		return;
+	}
+	if (canvas_tainted?.()) {
+		send_held = true;
+		return;
+	}
+	send_held = false;
 	var units = Math.floor(similarity * 10000 + 1e-7);
 	if (units > sent_units) {
 		var locations = [];
@@ -527,9 +560,8 @@ var built_palette = null, built_length = 0, built_shades = "";
 // rescore didn't score, and otherwise moves only the logic figure (task 7.2).
 function update(force = false) {
 	var c = 2;
-	var w = slotData.start_width ?? final_width / 2;
-	var h = slotData.start_height ?? final_height / 2;
 	var items = received();
+	var [w, h] = unlocked_size(items);
 	for (var item of items) {
 		switch (item) {
 			case "Additional Palette Color":
@@ -556,12 +588,6 @@ function update(force = false) {
 				break;
 			case "Progressive Pick Color": // its first copy is the tool, its second an auto copy mode (D23)
 				$("#TOOL_PICK_COLOR").removeClass("disabled");
-				break;
-			case "Progressive Canvas Width":
-				w = Math.min(w + (slotData.canvas_width_increment ?? slotData.canvas_size_increment ?? 100), final_width);
-				break;
-			case "Progressive Canvas Height":
-				h = Math.min(h + (slotData.canvas_height_increment ?? slotData.canvas_size_increment ?? 100), final_height);
 				break;
 		}
 	}
@@ -594,8 +620,42 @@ function update(force = false) {
 // for save-goal, so the goal as last read is dropped here, before anything judges against it (task 7.3).
 $G.on("save-goal", () => {
 	drop_goal_pixels();
-	if (session_name() !== "offline") calculate_similarity();
+	if (session_name() === "offline") return;
+	const similarity = calculate_similarity();
+	// The seed's goal is drawn, and a send held while it loaded goes out now, from this score (task 7.8). One that throws
+	// while disconnected leaves its checks for the next send.
+	if (send_held && goal_ready()) {
+		send_held = false;
+		try {
+			send(similarity);
+		} catch (error) {
+			console.warn("The checks held for the goal couldn't go out yet", error);
+		}
+	}
 });
+
+// The browser's canvas reads came clean after it blocked them (auto-copy.js, as its probe finds it): the goal as read
+// meanwhile was the browser's answer, and goes, so auto copy, M and the next score read it again. Once the probe that
+// found the reads clean has returned, the canvas is scored, and the status bar shows that score. Sends stay held until
+// a reload (send()).
+$G.on("canvas-reads-allowed", () => {
+	drop_goal_pixels();
+	setTimeout(() => {
+		if (session_name() !== "offline") calculate_similarity();
+	}, 0);
+});
+
+// The canvas size the items give, [width, height]: the start, and each canvas item's step, up to the goal's size. update()
+// gives the canvas this size, and so does Image > Attributes > Default while a game is loaded.
+function unlocked_size(items = received()) {
+	var w = slotData.start_width ?? final_width / 2;
+	var h = slotData.start_height ?? final_height / 2;
+	for (var item of items) {
+		if (item === "Progressive Canvas Width") w = Math.min(w + (slotData.canvas_width_increment ?? slotData.canvas_size_increment ?? 100), final_width);
+		else if (item === "Progressive Canvas Height") h = Math.min(h + (slotData.canvas_height_increment ?? slotData.canvas_size_increment ?? 100), final_height);
+	}
+	return [w, h];
+}
 
 // How many copies of an item have arrived: the rungs of a ladder (D23), the speed tiers, the shades of a channel.
 function rungs(name) {
@@ -657,5 +717,5 @@ function version_below(version) {
 	return false;
 }
 
-export { death_received, deathlink, fake_packet, fake_session, final_height, final_width, game_changed, handleTrap, loaded_game, mode_unlocked, progression_rungs, received, rungs, send, session_name, show_text_client, slotData, update, version_below };
+export { death_received, deathlink, fake_packet, fake_session, final_height, final_width, game_changed, handleTrap, loaded_game, mode_unlocked, progression_rungs, received, rungs, send, session_name, show_text_client, slotData, unlocked_size, update, version_below, watch_reads };
 

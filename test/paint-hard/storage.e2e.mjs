@@ -1826,10 +1826,11 @@ try {
 	});
 
 	// 27. Canvas reads blocked as the page loads, then allowed with no reload, as Firefox's canvas permission allows them
-	// (MS1, VH1). A session with nothing stored says once that it can't save, and saves the held change once reads are
-	// allowed. A session whose record holds a canvas keeps that record as it is for the rest of the page, since what the
-	// page read and wrote back while reads were blocked is the browser's placeholder, and its message says to reload once
-	// reads are allowed.
+	// (MS1, VH1, and S7's RC1). What the page read and wrote back onto the canvas while reads were blocked is the
+	// browser's placeholder, and it stays once they are allowed, so no session saves for the rest of the page. A session
+	// with nothing stored says once that it can't save, and to reload once reads are allowed; once they are, the page says
+	// once to reload, and the reload finds nothing stored. A session whose record holds a canvas keeps that record as it
+	// is, and its message says to reload once reads are allowed.
 	await section("allow", async () => {
 		// The stand-in for blocked reads of section 12, here until window.__allowed is set.
 		const BLOCKED_UNTIL_ALLOWED = `(() => {
@@ -1847,14 +1848,17 @@ try {
 		const held = await evaluate(() => window.__kit.paint(0, 100, 4));
 		await sleep(1500);
 		const blocked = { noise, writes: await writes_of(id), said: await boxes() };
-		check("MS1: with canvas reads blocked as the page loads, a session with nothing stored saves nothing, and says once that it can't save its canvas until reads are allowed", blocked.noise === "blocked" && blocked.writes === 0 && blocked.said.length === 1 && /can't save this tab's canvas/.test(blocked.said[0]) && /saving starts again/.test(blocked.said[0]), JSON.stringify(blocked));
+		check("MS1: with canvas reads blocked as the page loads, a session with nothing stored saves nothing, and says once that it can't save its canvas, and to allow canvas reads, then reload", blocked.noise === "blocked" && blocked.writes === 0 && blocked.said.length === 1 && /what you paint before a reload isn't saved/.test(blocked.said[0]) && /then reload this tab\. Paint sends no checks until then\./.test(blocked.said[0]), JSON.stringify(blocked));
 		await close_windows();
 		await evaluate(() => { window.__allowed = true; });
-		const landed = await wait_record(id, held.area, held.digest);
+		await sleep(1000);
+		await evaluate(() => window.__kit.paint(100, 160, 5));
+		await sleep(1500);
+		const unheld = { noise: await evaluate(() => window.paint_hard_auto_copy.read_noise()), writes: await writes_of(id), said: await boxes() };
 		await use_scripts(PAINT, RECORDS, FAST, COUNT_WINDOWS, KIT);
 		await reload_paint(ready);
-		const back = { id: await id_now(), page: await page_area(held.area) };
-		check("MS1: ...and once reads are allowed, with no reload and no other change, the held change is saved, and a reload brings it back", landed?.area === held.digest && back.id === id && back.page.digest === held.digest, JSON.stringify({ landed: landed?.area ?? null, back, want: held.digest }));
+		const back = { id: await id_now(), record: await record_of(id), page: await page_area(held.area) };
+		check("MS1: ...and once reads are allowed with no reload, neither the held change nor a change after it is saved, the page says once to reload this tab to send checks and save, and the reload finds nothing stored", unheld.noise === null && unheld.writes === 0 && unheld.said.length === 1 && /reload this tab to send checks and save/.test(unheld.said[0]) && back.id === id && back.record === null && back.page.digest !== held.digest, JSON.stringify({ allowed: unheld, back, held: held.digest }));
 		await forget(id);
 		// A session whose record holds a canvas, at a later load with reads blocked.
 		await open_paint(ready);

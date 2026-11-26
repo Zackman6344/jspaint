@@ -5,8 +5,9 @@
 import { $DialogWindow } from "./$ToolWindow.js";
 // import { localize } from "./app-localization.js";
 import { final_height, final_width, loaded_game } from "./archipelago.js";
-import { copies_unsaved, reads_are_blocked } from "./auto-copy.js";
+import { canvas_tainted, copies_unsaved, reads_are_blocked } from "./auto-copy.js";
 import { change_url_param, get_uris, load_image_from_uri, open_from_image_info, open_session_canvas, redo, reset_canvas_and_history, reset_file, show_error_message, show_resource_load_error_message, undo, undoable, update_title } from "./functions.js";
+import { drawn_seed_goal, goal_locked } from "./goal.js";
 import { $G, debounce, get_help_folder_icon, image_data_match, is_discord_embed, make_canvas, to_canvas_coords } from "./helpers.js";
 import { close_db, error_kind, idb_state, on_idb, open_db, request_of, sha256_of, transact } from "./idb.js";
 import { storage_quota_exceeded } from "./manage-storage.js";
@@ -271,7 +272,8 @@ $G.on("connect-click", () => {
 
 // Each storage failure says so once a page, until a save lands again.
 let failure_shown = false;
-// What the page has said about saves held while the browser blocks canvas reads. Each message shows once a page.
+// What the page has said about saves and sends held because the browser blocked canvas reads. Each message shows once a
+// page.
 const blocked_said = new Set();
 const say_blocked = (message) => {
 	if (!blocked_said.has(message)) {
@@ -279,6 +281,11 @@ const say_blocked = (message) => {
 		show_error_message(message);
 	}
 };
+// Once reads are allowed again, the canvas may still hold what the blocked reads drew back onto it, so saves and sends
+// wait for a reload (auto-copy.js's canvas_tainted()), and the page says so.
+$G.on("canvas-reads-allowed", () => {
+	say_blocked("Now that canvas reads are allowed, reload this tab to send checks and save.");
+});
 on_idb("blocked", () => {
 	show_error_message("Paint is waiting for another of its tabs, from an older version, to let go of its storage. Close or reload Paint's other tabs.");
 });
@@ -332,6 +339,30 @@ const data_url_of = (blob) => new Promise((resolve, reject) => {
 // with other bytes after each restart, so there the same goal gets a new key in each run of the browser, and the record
 // under the old key goes once no session refers to it.
 const goal_key_of = async (blob, id) => (await sha256_of(blob)) ?? `session:${id}`;
+// Task 7.8 and D18: the seed's own goal file, as goal.js drew it and checked it, kept in the goals store under its
+// SHA-256 with its address, so a reload or a later visit reads it from there in place of a download. It goes in once,
+// in a transaction of its own after the record that refers to it has landed, and is left as stored after that: Firefox
+// can let go of a stored file's bytes for a page that read them once its record is put again, and a copy that no longer
+// matched the seed's has gone by now (goal.js). The store is only a cache of the file. One without room for it, as a
+// full store, keeps no copy and says nothing, and the session's record has landed all the same. A file the store
+// refused isn't offered to it again on this page. The put is waited on: Firefox fails a put past the quota on its
+// request alone, and once the transaction is told to commit, commits it without the file and with no error.
+const seed_files_refused = new Set();
+async function store_seed_file(goal) {
+	if (seed_files_refused.has(goal.sha256)) return;
+	try {
+		await transact(["goals"], "readwrite", async ({ goals }) => {
+			if (!(await request_of(goals.count(goal.sha256)))) {
+				await request_of(goals.put({ sha256: goal.sha256, blob: goal.blob, width: goal.width, height: goal.height, url: goal.url, used_at: Date.now() }));
+			}
+		}, STRICT);
+	} catch (error) {
+		seed_files_refused.add(goal.sha256);
+		log("The goal image's file wasn't kept in storage:", error_kind(error), error);
+	} finally {
+		close_db();
+	}
+}
 // Lets go of a blob: address made for a stored goal's file once the goal image holds another address, now or at its
 // next load. While the image holds it, a login sets the same address again, which loads it again.
 function revoke_when_replaced(url) {
@@ -634,6 +665,9 @@ class LocalSession {
 		this.backend = null;
 		this.goal = null;
 		this.goal_drawn = false;
+		// The seed's own goal file, drawn since the last save, from a seed that names its goal (goal.js, task 7.8): the
+		// record refers to it under its SHA-256, and the next save stores it in the goals store once, with its address.
+		this.seed_goal = null;
 		this.copied_from = null;
 		this.local_left = false;
 		this.changes = 0;
@@ -646,11 +680,10 @@ class LocalSession {
 		this.save_every = save_every_floor();
 		this.last_cost = 0;
 		this.release_lock = null;
-		// Whether a record under this session's id holds a canvas: one the restore brought back, or one a save stored. And
-		// the holds on its saves: for the rest of the page's life, after reads were blocked while such a record was stored
-		// (save()), and while an import writes over its record (import_local_session()).
+		// Whether a record under this session's id holds a canvas: one the restore brought back, or one a save stored, which
+		// the message for blocked reads names (save()). And the hold on its saves while an import writes over its record
+		// (import_local_session()). A page whose canvas reads were blocked holds every save until a reload (save()).
 		this.has_record = false;
-		this.blocked_hold = false;
 		this.import_hold = false;
 		log(`Session record: ${session_id}`);
 		this.restored = this.restore();
@@ -674,11 +707,19 @@ class LocalSession {
 				$colorbox.rebuild_palette(palette); // with no palette given, it builds the starting one
 			}
 		});
-		$G.on("save-goal.session-hook", () => {
+		$G.on("save-goal.session-hook", (_event, seed_goal) => {
+			// The seed's own goal, which goal.js drew: the record takes its file, in place of a PNG of the goal canvas.
+			if (seed_goal) {
+				this.seed_goal = seed_goal;
+				this.goal_drawn = false;
+				this.ask_save();
+				return;
+			}
 			// The goal the restore loads saves nothing: the record keeps it as stored.
 			if (this.restoring_goal) {
 				return;
 			}
+			this.seed_goal = null;
 			this.goal_drawn = true;
 			this.ask_save();
 		});
@@ -816,7 +857,8 @@ class LocalSession {
 				palette = this.palette;
 			}
 			this.png_bytes = record.canvas.size;
-			this.goal = found.goal_file ? { sha256: found.goal_file.sha256, blob: found.goal_file.blob, uri: found.goal_file.uri ?? null } : null;
+			const stored_goal = found.goal_file;
+			this.goal = stored_goal ? { sha256: stored_goal.sha256, blob: stored_goal.blob, uri: stored_goal.uri ?? null, ...(stored_goal.url ? { url: stored_goal.url, width: stored_goal.width, height: stored_goal.height } : {}) } : null;
 			const canvas = createImageBitmap(record.canvas, { colorSpaceConversion: "none" }).then((bitmap) => {
 				record.width = bitmap.width;
 				record.height = bitmap.height;
@@ -839,6 +881,11 @@ class LocalSession {
 					this.canvas_landed = true;
 					this.has_record = this.id === stored_id;
 					open_session_canvas(bitmap);
+					// With a seed that locks its goal loaded, the record takes that seed's goal at its next save (task 7.8).
+					const seed_goal = drawn_seed_goal();
+					if (seed_goal && seed_goal.sha256 !== this.goal?.sha256) {
+						this.seed_goal = seed_goal;
+					}
 				}
 			}, (error) => {
 				// The record's own canvas won't decode. A copy the tab left in sessionStorage that won't decode leaves its
@@ -846,9 +893,12 @@ class LocalSession {
 				unreadable = found.from !== "staged";
 				throw error;
 			});
-			// The address made for a goal's file is kept, to revoke it if the goal comes off the page again.
-			this.goal_url = this.goal && !this.goal.uri ? URL.createObjectURL(this.goal.blob) : null;
-			const goal = this.goal ? this.restore_goal(this.goal.uri ?? this.goal_url) : null;
+			// The address made for a goal's file is kept, to revoke it if the goal comes off the page again. A seed's own goal,
+			// and any stored goal while a seed that locks its goal is loaded, stays off the page: the login draws the seed's
+			// goal (goal.js, task 7.8), and a 4096x4096 file would be decoded for nothing.
+			const shows_goal = !!this.goal && !this.goal.url && !goal_locked();
+			this.goal_url = shows_goal && !this.goal.uri ? URL.createObjectURL(this.goal.blob) : null;
+			const goal = shows_goal ? this.restore_goal(this.goal.uri ?? this.goal_url) : null;
 			await Promise.all([canvas, goal]);
 			return "restored";
 		})().catch((error) => {
@@ -1047,29 +1097,23 @@ class LocalSession {
 			this.save();
 		}, wait);
 	}
-	// Saves the session now, unless reads are blocked, where the PNG would come out blank and overwrite the record. Then
-	// the page says once that it can't save. A session with no record under its id tries again a save interval later for
-	// as long as a change waits, so saving starts again once the player allows canvas reads, with no reload. A session
-	// whose record holds a canvas saves nothing more on this page: what the page read and wrote back onto the canvas while
-	// reads were blocked, as a login that grows the canvas does, is the browser's placeholder, and a save once reads are
-	// allowed would store it over that record. A reload restores the record. A last save, as the session ends, goes even
-	// with another in flight.
+	// Saves the session now, unless canvas reads are blocked, or were at any point since the page loaded (auto-copy.js's
+	// canvas_tainted(), which probes at each ask while the page counts as clean). A blocked read's PNG comes out blank,
+	// and what the page read and wrote back onto the canvas while reads were blocked, as an undo or an Undo Trap does, is
+	// the browser's placeholder, which stays on the canvas once reads are allowed. A save would store either over the
+	// session's record, or as a record where there was none. So no session saves on such a page, and a reload restores
+	// the last save, or a blank canvas where nothing was stored. While reads are blocked the page says once that it can't
+	// save, and once they are allowed it says to reload (canvas-reads-allowed). A last save, as the session ends, goes
+	// even with another in flight.
 	save({ last = false } = {}) {
-		if (this.left || this.blocked_hold || this.import_hold || (this.ended && !last)) {
+		if (this.left || this.import_hold || (this.ended && !last)) {
 			return Promise.resolve();
 		}
-		if (reads_are_blocked()) {
-			if (this.has_record) {
-				this.blocked_hold = true;
-				say_blocked("Your browser blocks reading the canvas, so Paint can't save this tab's canvas. Its last save stays as it is, and what you paint before a reload isn't saved. Allow canvas reads for this site, then reload this tab to go on from that save.");
-				return Promise.resolve();
-			}
-			say_blocked("Your browser blocks reading the canvas, so Paint can't save this tab's canvas. Allow canvas reads for this site, and saving starts again.");
-			if (!last && !this.timer && this.changes > this.saved_changes) {
-				this.timer = setTimeout(() => {
-					this.timer = null;
-					this.save();
-				}, this.save_every);
+		if (canvas_tainted()) {
+			if (reads_are_blocked()) {
+				say_blocked(this.has_record ?
+					"Your browser blocks reading the canvas, so Paint can't save this tab's canvas. Its last save stays as it is, and what you paint before a reload isn't saved. Allow canvas reads for this site, then reload this tab to go on from that save. Paint sends no checks until then." :
+					"Your browser blocks reading the canvas, so what you paint before a reload isn't saved. Allow canvas reads for this site, then reload this tab. Paint sends no checks until then.");
 			}
 			return Promise.resolve();
 		}
@@ -1143,9 +1187,10 @@ class LocalSession {
 	// one was drawn since, as toBlob copies them before it answers, so what the page does next, a later session's
 	// restore among it, isn't in the record. The browser makes the PNGs after the call returns, then one transaction puts
 	// the record and the goal, after the record of `before`, a save still in flight. A goal no session refers to any more
-	// goes with it. Once the transaction has committed, the page closes its connection to the database, and the next use
-	// opens it again: Firefox keeps the file of the canvas this save replaced until then. The time the save held the
-	// page, in its own calls and in the long tasks that made its PNGs, sets how long the next waits.
+	// goes with it. A seed's own goal file goes in a transaction of its own once the record has landed (store_seed_file()).
+	// Once the transactions have committed, the page closes its connection to the database, and the next use opens it
+	// again: Firefox keeps the file of the canvas this save replaced until then. The time the save held the page, in its
+	// own calls and in the long tasks that made its PNGs, sets how long the next waits.
 	async write_idb(before = null) {
 		const began = performance.now();
 		const fields = this.fields();
@@ -1153,16 +1198,20 @@ class LocalSession {
 		const redrawn = this.goal_drawn;
 		const goal_png = redrawn ? png_of(goal_canvas) : null;
 		const goal_size = { width: goal_canvas.width, height: goal_canvas.height };
+		const seed = this.seed_goal;
 		this.goal_drawn = false;
+		this.seed_goal = null;
 		const cost = performance.now() - began;
+		let goal = null;
 		try {
 			const { blob, called, came } = await canvas;
 			const pngs = [{ called, came }];
-			let goal = null;
 			if (goal_png) {
 				const file = await goal_png;
 				pngs.push({ called: file.called, came: file.came });
 				goal = { sha256: await goal_key_of(file.blob, this.id), blob: file.blob, uri: null, ...goal_size };
+			} else if (seed) {
+				goal = { sha256: seed.sha256, blob: seed.blob, uri: null, width: seed.width, height: seed.height, url: seed.url };
 			}
 			await Promise.resolve(before).catch(() => { });
 			const old_goal = this.goal?.sha256 ?? null;
@@ -1170,10 +1219,13 @@ class LocalSession {
 			const record = { ...fields, canvas: blob, goal: kept?.sha256 ?? null };
 			await transact(["sessions", "goals"], "readwrite", async ({ sessions, goals }) => {
 				sessions.put(record);
-				if (goal) {
+				// A seed's own goal file, which has its address, goes in a transaction of its own once this one has landed
+				// (store_seed_file()).
+				if (goal && !goal.url) {
 					goals.put({ sha256: goal.sha256, blob: goal.blob, width: goal.width, height: goal.height, used_at: Date.now() });
-				} else if (kept && !(await request_of(goals.count(kept.sha256)))) {
-					// Removed in another tab's Manage Storage while this page went on with it.
+				} else if (kept && !kept.url && !(await request_of(goals.count(kept.sha256)))) {
+					// Removed in another tab's Manage Storage while this page went on with it. A seed's goal comes back only from
+					// goal.js's next draw, which checks it.
 					goals.put({ sha256: kept.sha256, blob: kept.blob, width: null, height: null, used_at: Date.now() });
 				}
 				if (old_goal && old_goal !== record.goal && !(await request_of(sessions.index("goal").count(old_goal)))) {
@@ -1188,14 +1240,22 @@ class LocalSession {
 			this.last_cost = cost + long_task_time(pngs);
 		} catch (error) {
 			if (redrawn) this.goal_drawn = true;
+			if (seed) this.seed_goal ??= seed;
 			throw error;
 		}
+		if (goal?.url) await store_seed_file(goal);
 		this.save_every = save_every_after(this.last_cost);
 	}
 	// One save to localStorage, where IndexedDB isn't available: the JSON record from before task 7.4, the canvas and the
 	// goal as data URLs.
 	write_local() {
 		const began = performance.now();
+		// A seed's own goal isn't kept here: at 4096x4096 its data URL would pass localStorage's room many times over, and
+		// the login loads it again (task 7.8).
+		if (this.seed_goal) {
+			this.seed_goal = null;
+			this.goal = null;
+		}
 		let goal = this.goal?.uri ?? null;
 		if (this.goal_drawn) {
 			this.goal_drawn = false;
@@ -1229,10 +1289,10 @@ class LocalSession {
 	// lands. Auto copy and M ask for a save at most every 5 s, so pixels they painted since count as a change too: the
 	// session asks them as it looks, whichever pagehide listener runs first. A session whose saves are held leaves no copy.
 	save_at_pagehide() {
-		if (this.left || this.ended || this.restoring || this.blocked_hold || this.import_hold || (this.changes <= this.saved_changes && !copies_unsaved())) {
+		if (this.left || this.ended || this.restoring || this.import_hold || (this.changes <= this.saved_changes && !copies_unsaved())) {
 			return;
 		}
-		if (reads_are_blocked() || main_canvas.width * main_canvas.height > UNLOAD_SAVE_PIXELS) {
+		if (canvas_tainted() || main_canvas.width * main_canvas.height > UNLOAD_SAVE_PIXELS) {
 			return;
 		}
 		try {
@@ -2289,9 +2349,12 @@ async function export_local_session() {
 		show_error_message(localize("No local session is available to export."));
 		return;
 	}
-	// A browser that blocks canvas reads gives a blank picture in place of the canvas, and the file would hold that.
-	if (reads_are_blocked()) {
-		show_error_message("Your browser blocks reading the canvas, so Paint can't write this session to a file. Allow canvas reads for this site, then export again.");
+	// A browser that blocks canvas reads gives a blank picture in place of the canvas, and the file would hold that. Once
+	// reads are allowed, the canvas may hold what the blocked reads drew back onto it, until a reload (canvas_tainted()).
+	if (canvas_tainted()) {
+		show_error_message(reads_are_blocked() ?
+			"Your browser blocks reading the canvas, so Paint can't write this session to a file. Allow canvas reads for this site, then reload this tab and export again." :
+			"Your browser blocked reading the canvas earlier on this page, so Paint can't write this session to a file. Reload this tab, then export again.");
 		return;
 	}
 	const session_id = current_session.id;
